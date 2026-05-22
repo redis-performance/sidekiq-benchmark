@@ -12,9 +12,9 @@ pub struct SidekiqJob {
     /// Full layout: ["string", idx, {"mike":"bob"}, enqueued_at_ns]
     pub args: Vec<serde_json::Value>,
     pub queue: String,
-    pub retry: bool,
-    pub created_at: f64,  // required by rusty-sidekiq Job struct
-    pub enqueued_at: f64, // Unix seconds — standard Sidekiq field
+    pub retry: serde_json::Value, // matches Ruby retry: 1 (retry once on failure)
+    pub created_at: f64,          // required by rusty-sidekiq Job struct
+    pub enqueued_at: f64,         // Unix seconds — standard Sidekiq field
 }
 
 impl SidekiqJob {
@@ -35,7 +35,7 @@ impl SidekiqJob {
                 serde_json::Value::Number(enqueued_at_ns.into()),
             ],
             queue: queue.to_string(),
-            retry: false,
+            retry: serde_json::json!(1), // Ruby sidekiqload default: retry: 1
             created_at: enqueued_at_secs,
             enqueued_at: enqueued_at_secs,
         }

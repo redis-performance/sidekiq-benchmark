@@ -21,8 +21,10 @@ use tokio::sync::{mpsc, watch};
     about = "Sidekiq protocol load benchmark — measures job throughput and latency against any Redis endpoint"
 )]
 struct Cli {
-    /// Redis URL (takes precedence over --host/--port)
-    #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379/0")]
+    /// Redis URL (takes precedence over --host/--port).
+    /// Defaults to db 13 — the same safety default as Ruby's bin/sidekiqload — to avoid
+    /// colliding with application data and to make --allow-flushdb safe by default.
+    #[arg(long, env = "REDIS_URL", default_value = "redis://127.0.0.1:6379/13")]
     url: String,
 
     /// Override host in the Redis URL
@@ -41,8 +43,8 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
-    /// Redis database number
-    #[arg(long, default_value = "0")]
+    /// Redis database number (default 13 matches Ruby sidekiqload's safety default)
+    #[arg(long, default_value = "13")]
     db: u8,
 
     /// Comma-separated concurrency levels — each becomes a separate trial
@@ -363,6 +365,20 @@ async fn main() -> Result<()> {
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
 
+    // Warn loudly if FLUSHDB is enabled on db 0 — application data lives there by default.
+    if cli.allow_flushdb {
+        let db_in_url = url::Url::parse(&url)
+            .ok()
+            .and_then(|u| u.path().trim_matches('/').parse::<u8>().ok())
+            .unwrap_or(0);
+        if db_in_url == 0 {
+            eprintln!(
+                "warning: --allow-flushdb is set on db 0 — this will destroy ALL keys in the \
+                 database. Use --db 13 (or any non-zero db) to isolate benchmark data."
+            );
+        }
+    }
+
     if let Some(out) = &cli.output {
         validate_output_path(out)?;
     }
@@ -404,6 +420,17 @@ async fn main() -> Result<()> {
     let mut results: Vec<TrialResult> = Vec::new();
     let mut any_timeout = false;
 
+    // Warn if the queue fill will likely use significant Redis memory.
+    // ~300 B per job (class, jid, args array, queue, retry, timestamps).
+    let estimated_mb = cli.jobs as f64 * 300.0 / (1024.0 * 1024.0);
+    if estimated_mb > 100.0 {
+        eprintln!(
+            "warning: estimated peak Redis memory ~{:.0} MB ({} jobs × ~300 B/job)",
+            estimated_mb,
+            report::format_n(cli.jobs)
+        );
+    }
+
     for &n_workers in &workers_list {
         if cli.warmup_jobs > 0 {
             pre_trial_clear(&mut conn, &cli.queue, cli.allow_flushdb).await?;
@@ -421,7 +448,34 @@ async fn main() -> Result<()> {
             print!("  [{n_workers:>4} workers] ");
         }
 
+        // Snapshot processes set before the trial so we can clean up entries added by
+        // rusty-sidekiq (which has no SREM on shutdown — a known upstream gap).
+        let processes_before: Vec<String> = redis::cmd("SMEMBERS")
+            .arg("processes")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+
         let result = run_trial(&cfg, n_workers).await?;
+
+        // Remove any process heartbeat entries that this trial added.
+        let processes_after: Vec<String> = redis::cmd("SMEMBERS")
+            .arg("processes")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
+        let before_set: std::collections::HashSet<&str> =
+            processes_before.iter().map(|s| s.as_str()).collect();
+        for entry in &processes_after {
+            if !before_set.contains(entry.as_str()) {
+                let _: Result<(), _> = redis::cmd("SREM")
+                    .arg("processes")
+                    .arg(entry)
+                    .query_async(&mut conn)
+                    .await;
+            }
+        }
+
         if result.timed_out {
             any_timeout = true;
         }

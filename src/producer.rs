@@ -3,13 +3,13 @@ use anyhow::Result;
 
 const BATCH_SIZE: usize = 1000;
 
-/// Delete only the benchmark queue key — safe to use on shared Redis.
-/// This is the default pre-trial cleanup.
+/// Delete the benchmark queue key and remove it from the `queues` set.
+/// This is the default pre-trial cleanup — safe to use on shared Redis.
 pub async fn clear_queue(conn: &mut redis::aio::MultiplexedConnection, queue: &str) -> Result<()> {
-    redis::cmd("DEL")
-        .arg(format!("queue:{queue}"))
-        .query_async::<()>(conn)
-        .await?;
+    let mut pipe = redis::pipe();
+    pipe.cmd("DEL").arg(format!("queue:{queue}")).ignore();
+    pipe.cmd("SREM").arg("queues").arg(queue).ignore();
+    pipe.query_async::<()>(conn).await?;
     Ok(())
 }
 

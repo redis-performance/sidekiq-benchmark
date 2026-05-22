@@ -54,12 +54,12 @@ cargo build --release
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
-| `--url` | `REDIS_URL` | `redis://127.0.0.1:6379/0` | Full URL |
+| `--url` | `REDIS_URL` | `redis://127.0.0.1:6379/13` | Full URL |
 | `--host` | — | — | Override host component |
 | `--port` | — | — | Override port component |
 | `--password` | `REDIS_PASSWORD` | — | Auth |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
-| `--db` | — | `0` | Database number |
+| `--db` | — | `13` | Database number (matches Ruby sidekiqload safety default) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels |
 | `--jobs` | — | `500000` | Total jobs per trial |
 | `--warmup-jobs` | — | `0` | Warmup pass jobs (0 = skip) |
@@ -110,7 +110,7 @@ sidekiq-bench --workers N --jobs 500000
   "tag": "redis-8.0",
   "timestamp": "2026-05-22T01:30:00Z",
   "config": {
-    "url": "redis://127.0.0.1:6379/0",
+    "url": "redis://127.0.0.1:6379/13",
     "workers": [10, 50, 100, 200],
     "jobs_per_trial": 500000,
     "queue": "default",
@@ -135,6 +135,35 @@ sidekiq-bench --workers N --jobs 500000
 ```
 
 Latency values are in **microseconds**.
+
+## Safety notes
+
+### Default database: 13
+
+The default Redis database is **13**, matching Ruby's `bin/sidekiqload`. This avoids
+colliding with application data (which typically lives in db 0) and makes `--allow-flushdb`
+safe by default. Always confirm the target db before running against a shared Redis.
+
+### Shared / production Redis
+
+Do **not** run this benchmark against a production Redis instance. The benchmark
+pre-fills the queue with hundreds of thousands of jobs and (optionally) flushes the
+entire database. Use a dedicated benchmark instance or an isolated database number.
+
+### Intentionally omitted Sidekiq metric keys
+
+Ruby Sidekiq 8 middleware writes housekeeping keys (`stat:processed`, `stat:failed`,
+`j|*` job detail hashes, `h|*` history hashes) as a side-effect of normal operation.
+This benchmark measures **queue mechanics in isolation** — enqueue throughput and BRPOP
+latency — so those keys are intentionally omitted. They would add per-job Redis writes
+that obscure the metric we care about. The `queues` set and `queue:default` list are
+managed as in production; `processes` heartbeat entries are cleaned up after each trial.
+
+### `processes` set cleanup
+
+`rusty-sidekiq` 0.14 does not remove process heartbeat entries from the `processes` set
+on shutdown (a known upstream gap). This tool works around it by snapshotting the set
+before each trial and removing any new entries afterwards.
 
 ## Building
 
