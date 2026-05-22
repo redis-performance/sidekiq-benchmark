@@ -1,0 +1,57 @@
+[package]
+name = "sidekiq-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sidekiq-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Sidekiq worker + processor (lib crate name: "sidekiq")
+rusty-sidekiq = "0.14.0"
+
+# bb8 connection pool — required by rusty-sidekiq Processor::new
+bb8 = "0.9"
+
+# async fn in trait (needed for #[async_trait] in worker.rs)
+async-trait = "0.1"
+
+# Redis client — aligned with rusty-sidekiq's redis dep
+# tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates
+# tokio-rustls-comp: async TLS integration; tls-rustls-webpki-roots: bundled root CAs (works in containers without OS ca-certificates)
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Latency histogram
+hdrhistogram = "7"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Random bytes for jid generation (Sidekiq jid = 24 hex chars = 12 random bytes)
+rand = "0.9"
+hex = "0.4"
+
+# Error handling
+anyhow = "1"
+
+# Table formatting
+comfy-table = "7"
+
+# Time formatting
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL parsing — safe password encoding and redaction
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
