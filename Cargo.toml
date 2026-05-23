@@ -8,8 +8,9 @@ name = "sidekiq-bench"
 path = "src/main.rs"
 
 [dependencies]
-# Sidekiq worker + processor (lib crate name: "sidekiq")
-rusty-sidekiq = "0.14.0"
+# Sidekiq worker + processor — our fork with processes-set cleanup on shutdown
+# https://github.com/redis-performance/sidekiq-rs (branch: fix/process-deregister-on-shutdown)
+rusty-sidekiq = { path = "sidekiq-rs" }
 
 # bb8 connection pool — required by rusty-sidekiq Processor::new
 bb8 = "0.9"

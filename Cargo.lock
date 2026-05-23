@@ -1157,8 +1157,6 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 [[package]]
 name = "rusty-sidekiq"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b89bb42e997e03b7b811aed77fd7c6a2d1e007d1e6b66ea88a84cd93541e4b"
 dependencies = [
  "async-trait",
  "bb8",

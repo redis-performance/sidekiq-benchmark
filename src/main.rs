@@ -448,33 +448,7 @@ async fn main() -> Result<()> {
             print!("  [{n_workers:>4} workers] ");
         }
 
-        // Snapshot processes set before the trial so we can clean up entries added by
-        // rusty-sidekiq (which has no SREM on shutdown — a known upstream gap).
-        let processes_before: Vec<String> = redis::cmd("SMEMBERS")
-            .arg("processes")
-            .query_async(&mut conn)
-            .await
-            .unwrap_or_default();
-
         let result = run_trial(&cfg, n_workers).await?;
-
-        // Remove any process heartbeat entries that this trial added.
-        let processes_after: Vec<String> = redis::cmd("SMEMBERS")
-            .arg("processes")
-            .query_async(&mut conn)
-            .await
-            .unwrap_or_default();
-        let before_set: std::collections::HashSet<&str> =
-            processes_before.iter().map(|s| s.as_str()).collect();
-        for entry in &processes_after {
-            if !before_set.contains(entry.as_str()) {
-                let _: Result<(), _> = redis::cmd("SREM")
-                    .arg("processes")
-                    .arg(entry)
-                    .query_async(&mut conn)
-                    .await;
-            }
-        }
 
         if result.timed_out {
             any_timeout = true;
