@@ -52,7 +52,7 @@ docker run --rm redis/sidekiq-benchmark \
 docker compose run --rm bench
 
 # Use a different Redis image
-REDIS_IMAGE=redis:7.4 docker compose run --rm bench
+REDIS_IMAGE=redis:7.4 docker compose run --rm bench  # override to a different version
 
 # Point at an external Redis
 REDIS_URL=redis://myhost:6379/0 docker compose run --rm bench
