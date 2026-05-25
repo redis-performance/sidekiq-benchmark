@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use hdrhistogram::Histogram;
 use metrics::{LatencyStats, Metrics, TrialResult};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
@@ -68,6 +69,11 @@ struct Cli {
     /// Queue names are generated as <queue>_0, <queue>_1, … when > 1.
     #[arg(long, default_value = "1")]
     num_queues: usize,
+
+    /// Per-second latency percentiles to record (comma-separated).
+    /// Supported values: p50, p75, p90, p95, p99, p999, p9999, max, mean.
+    #[arg(long, default_value = "p50,p90,p99,p999,max", value_delimiter = ',')]
+    latency_percentiles: Vec<String>,
 
     /// Label for output (defaults to redis_version from INFO)
     #[arg(long)]
@@ -167,6 +173,59 @@ fn validate_output_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Per-second latency percentile specs ──────────────────────────────────────
+
+#[derive(Clone)]
+enum PercentileSpec {
+    Quantile { name: String, q: f64 },
+    Max,
+    Mean,
+}
+
+impl PercentileSpec {
+    fn name(&self) -> &str {
+        match self {
+            Self::Quantile { name, .. } => name,
+            Self::Max => "max",
+            Self::Mean => "mean",
+        }
+    }
+
+    fn value(&self, hist: &Histogram<u64>) -> u64 {
+        if hist.is_empty() {
+            return 0;
+        }
+        match self {
+            Self::Quantile { q, .. } => hist.value_at_quantile(*q),
+            Self::Max => hist.max(),
+            Self::Mean => hist.mean() as u64,
+        }
+    }
+}
+
+/// Parse a percentile spec string: "p50" → 0.50, "p999" → 0.999, "max", "mean".
+fn parse_percentile_spec(s: &str) -> Result<PercentileSpec> {
+    match s {
+        "max" => Ok(PercentileSpec::Max),
+        "mean" => Ok(PercentileSpec::Mean),
+        s if s.starts_with('p') => {
+            let digits = &s[1..];
+            anyhow::ensure!(!digits.is_empty(), "invalid percentile spec: '{s}'");
+            let n: u64 = digits
+                .parse()
+                .with_context(|| format!("invalid percentile spec: '{s}'"))?;
+            let divisor = 10u64.pow(digits.len() as u32);
+            let q = n as f64 / divisor as f64;
+            anyhow::ensure!(q > 0.0 && q <= 1.0, "percentile out of range (0, 1]: '{s}'");
+            Ok(PercentileSpec::Quantile {
+                name: s.to_string(),
+                q,
+            })
+        }
+        _ => anyhow::bail!("unknown percentile spec '{s}' — use p50, p99, p999, max, mean"),
+    }
+}
+
 /// Generate queue names from a base name and count.
 /// With n=1 returns `["default"]`; with n=4 returns `["default_0".."default_3"]`.
 fn make_queue_names(base: &str, n: usize) -> Vec<String> {
@@ -221,6 +280,7 @@ struct TrialConfig<'a> {
     jobs: u64,
     timeout_secs: u64,
     quiet: bool,
+    percentile_specs: &'a [PercentileSpec],
 }
 
 fn empty_histogram() -> Histogram<u64> {
@@ -272,23 +332,54 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let mut proc_handle = tokio::spawn(async move { processor.run().await });
     let abort_handle = proc_handle.abort_handle();
 
-    // Per-second throughput samples collected by the monitor task
+    // Per-second samples collected by the monitor task
     let throughput_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-    let samples_for_monitor = throughput_samples.clone();
+    let errors_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let latency_sec_samples: Arc<Mutex<HashMap<String, Vec<u64>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let tput_for_monitor = throughput_samples.clone();
+    let err_for_monitor = errors_samples.clone();
+    let lat_for_monitor = latency_sec_samples.clone();
     let metrics_mon = metrics.clone();
+    let specs_for_monitor = cfg.percentile_specs.to_vec();
     let quiet = cfg.quiet;
+
     let monitor = tokio::spawn(async move {
-        let mut prev = 0u64;
+        let mut prev_completed = 0u64;
+        let mut prev_errors = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+
             let cur = metrics_mon.get_completed();
-            let delta = cur - prev;
-            prev = cur;
-            if let Ok(mut v) = samples_for_monitor.lock() {
-                v.push(delta);
+            let tput_delta = cur - prev_completed;
+            prev_completed = cur;
+            if let Ok(mut v) = tput_for_monitor.lock() {
+                v.push(tput_delta);
             }
+
+            let cur_err = metrics_mon.get_errors();
+            let err_delta = cur_err - prev_errors;
+            prev_errors = cur_err;
+            if let Ok(mut v) = err_for_monitor.lock() {
+                v.push(err_delta);
+            }
+
+            let snap = metrics_mon.drain_per_sec();
+            if let Ok(mut map) = lat_for_monitor.lock() {
+                for spec in &specs_for_monitor {
+                    map.entry(spec.name().to_string())
+                        .or_default()
+                        .push(spec.value(&snap));
+                }
+            }
+
             if !quiet {
-                print!(".");
+                if err_delta > 0 {
+                    print!("[e:{err_delta}]");
+                } else {
+                    print!(".");
+                }
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
@@ -346,8 +437,13 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let hist = collector.await.unwrap_or_else(|_| empty_histogram());
 
     let total_jobs = metrics.get_completed();
-    let errors = metrics.errors.load(std::sync::atomic::Ordering::Relaxed);
+    let errors = metrics.get_errors();
     let throughput_per_sec = throughput_samples
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    let errors_per_sec = errors_samples.lock().map(|v| v.clone()).unwrap_or_default();
+    let latency_per_sec = latency_sec_samples
         .lock()
         .map(|v| v.clone())
         .unwrap_or_default();
@@ -364,6 +460,8 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         duration_s: duration.as_secs_f64(),
         jobs_per_sec,
         throughput_per_sec,
+        errors_per_sec,
+        latency_per_sec,
         latency: LatencyStats::from_histogram(&hist),
         errors,
         timed_out,
@@ -437,12 +535,19 @@ async fn main() -> Result<()> {
         .await
         .context("failed to connect to Redis")?;
 
+    let percentile_specs: Vec<PercentileSpec> = cli
+        .latency_percentiles
+        .iter()
+        .map(|s| parse_percentile_spec(s))
+        .collect::<Result<Vec<_>>>()?;
+
     let cfg = TrialConfig {
         url: &url,
         queues: &queue_names,
         jobs: cli.jobs,
         timeout_secs: cli.timeout,
         quiet: cli.quiet,
+        percentile_specs: &percentile_specs,
     };
     // Warmup uses the same settings but targets warmup_jobs completions
     let warmup_cfg = TrialConfig {
@@ -591,6 +696,7 @@ mod tests {
             warmup_jobs: 0,
             queue: "default".into(),
             num_queues: 1,
+            latency_percentiles: vec![],
             tag: None,
             output: None,
             timeout: 300,
@@ -621,6 +727,7 @@ mod tests {
             warmup_jobs: 0,
             queue: "default".into(),
             num_queues: 1,
+            latency_percentiles: vec![],
             tag: None,
             output: None,
             timeout: 300,
@@ -645,6 +752,7 @@ mod tests {
             warmup_jobs: 0,
             queue: "default".into(),
             num_queues: 1,
+            latency_percentiles: vec![],
             tag: None,
             output: None,
             timeout: 300,
@@ -655,5 +763,49 @@ mod tests {
         let parsed = url::Url::parse(&url).unwrap();
         assert_eq!(parsed.host_str().unwrap(), "10.0.0.1");
         assert_eq!(parsed.port().unwrap(), 6380);
+    }
+
+    #[test]
+    fn parse_percentile_spec_valid() {
+        let cases: &[(&str, f64)] = &[
+            ("p50", 0.50),
+            ("p90", 0.90),
+            ("p99", 0.99),
+            ("p999", 0.999),
+            ("p9999", 0.9999),
+            ("p75", 0.75),
+        ];
+        for &(s, expected_q) in cases {
+            match parse_percentile_spec(s).unwrap() {
+                PercentileSpec::Quantile { q, name } => {
+                    assert!((q - expected_q).abs() < 1e-9, "{s}: got {q}");
+                    assert_eq!(name, s);
+                }
+                other => panic!("{s} parsed as non-quantile: {}", other.name()),
+            }
+        }
+        assert!(matches!(
+            parse_percentile_spec("max").unwrap(),
+            PercentileSpec::Max
+        ));
+        assert!(matches!(
+            parse_percentile_spec("mean").unwrap(),
+            PercentileSpec::Mean
+        ));
+    }
+
+    #[test]
+    fn parse_percentile_spec_invalid() {
+        assert!(parse_percentile_spec("p0").is_err()); // 0/10 = 0.0 out of range
+        assert!(parse_percentile_spec("p").is_err());
+        assert!(parse_percentile_spec("pxyz").is_err());
+        assert!(parse_percentile_spec("99").is_err());
+        assert!(parse_percentile_spec("").is_err());
+    }
+
+    #[test]
+    fn make_queue_names_single_and_multi() {
+        assert_eq!(make_queue_names("default", 1), vec!["default"]);
+        assert_eq!(make_queue_names("q", 3), vec!["q_0", "q_1", "q_2"]);
     }
 }

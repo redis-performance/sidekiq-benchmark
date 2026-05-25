@@ -1,10 +1,14 @@
 use hdrhistogram::Histogram;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Shared counters updated atomically by worker tasks.
 pub struct Metrics {
     pub completed: AtomicU64,
     pub errors: AtomicU64,
+    /// Short-lived histogram drained every second by the monitor task.
+    per_sec_hist: Mutex<Histogram<u64>>,
 }
 
 impl Metrics {
@@ -12,6 +16,10 @@ impl Metrics {
         Self {
             completed: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            per_sec_hist: Mutex::new(
+                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
+                    .expect("valid histogram bounds"),
+            ),
         }
     }
 
@@ -29,6 +37,26 @@ impl Metrics {
     pub fn get_completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
     }
+
+    pub fn get_errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Record a latency sample (µs) into the per-second window histogram.
+    pub fn record_latency_per_sec(&self, us: u64) {
+        if let Ok(mut h) = self.per_sec_hist.lock() {
+            let _ = h.record(us.max(1));
+        }
+    }
+
+    /// Snapshot and reset the per-second window histogram.
+    /// Called by the monitor task once per second.
+    pub fn drain_per_sec(&self) -> Histogram<u64> {
+        let mut g = self.per_sec_hist.lock().unwrap();
+        let snap = g.clone();
+        g.reset();
+        snap
+    }
 }
 
 impl Default for Metrics {
@@ -45,6 +73,8 @@ pub struct TrialResult {
     pub duration_s: f64,
     pub jobs_per_sec: f64,
     pub throughput_per_sec: Vec<u64>,
+    pub errors_per_sec: Vec<u64>,
+    pub latency_per_sec: HashMap<String, Vec<u64>>,
     pub latency: LatencyStats,
     pub errors: u64,
     pub timed_out: bool,
@@ -90,7 +120,6 @@ mod tests {
 
     #[test]
     fn empty_histogram_returns_zero_stats() {
-        // HDRHistogram requires low >= 1; lower bound 1 is the minimum
         let hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
         let stats = LatencyStats::from_histogram(&hist);
         assert_eq!(stats.total_count, 0);
@@ -103,7 +132,7 @@ mod tests {
     fn histogram_records_values_correctly() {
         let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
         for i in 1..=1000u64 {
-            let _ = hist.record(i * 1_000); // 1 ms to 1 s in µs
+            let _ = hist.record(i * 1_000);
         }
         let stats = LatencyStats::from_histogram(&hist);
         assert_eq!(stats.total_count, 1000);
@@ -118,5 +147,18 @@ mod tests {
         assert_eq!(m.inc_completed(), 1);
         assert_eq!(m.inc_completed(), 2);
         assert_eq!(m.get_completed(), 2);
+    }
+
+    #[test]
+    fn drain_per_sec_snapshots_and_resets() {
+        let m = Metrics::new();
+        m.record_latency_per_sec(100);
+        m.record_latency_per_sec(200);
+        m.record_latency_per_sec(300);
+        let snap = m.drain_per_sec();
+        assert_eq!(snap.len(), 3);
+        // Second drain should be empty
+        let empty = m.drain_per_sec();
+        assert!(empty.is_empty());
     }
 }

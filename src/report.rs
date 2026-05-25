@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use comfy_table::{Cell, Table};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Format a microsecond duration as a human-readable string.
 fn fmt_us(us: u64) -> String {
@@ -104,6 +105,8 @@ struct JsonResult {
     jobs_per_sec: f64,
     timed_out: bool,
     throughput_per_sec: Vec<u64>,
+    errors_per_sec: Vec<u64>,
+    latency_per_sec_us: HashMap<String, Vec<u64>>,
     latency_us: LatencyStats,
     errors: u64,
 }
@@ -143,6 +146,8 @@ pub fn write_json(
                 },
                 timed_out: r.timed_out,
                 throughput_per_sec: r.throughput_per_sec.clone(),
+                errors_per_sec: r.errors_per_sec.clone(),
+                latency_per_sec_us: r.latency_per_sec.clone(),
                 latency_us: r.latency.clone(),
                 errors: r.errors,
             })

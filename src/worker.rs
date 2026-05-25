@@ -40,7 +40,9 @@ impl sidekiq::Worker<serde_json::Value> for LoadWorker {
                 1
             };
             // Clamp to 1 µs minimum so the value is always within the histogram's lower bound
-            let _ = self.latency_tx.send(latency_us.max(1));
+            let clamped = latency_us.max(1);
+            let _ = self.latency_tx.send(clamped);
+            self.metrics.record_latency_per_sec(clamped);
         } else {
             self.metrics.inc_error();
         }
