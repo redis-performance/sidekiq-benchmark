@@ -4,13 +4,28 @@ We treat this repo as "Open Source" within Redis: anyone who clears the bar belo
 
 ## Local setup
 
-<!-- TODO: fill in repo-specific setup steps -->
+Requires Rust stable (1.75+) and a running Redis instance (any version 6+).
 
 ```bash
-# Example — replace with actual steps
-git clone git@github.com:redis-performance/<repo>.git
-cd <repo>
-# install dependencies, build, etc.
+git clone --recurse-submodules git@github.com:redis-performance/sidekiq-benchmark.git
+cd sidekiq-benchmark
+cargo build --release
+```
+
+The `--recurse-submodules` flag is required because the Sidekiq worker implementation lives in `sidekiq-rs/` as a git submodule.
+
+To verify the build works end-to-end, spin up Redis and run a quick smoke test:
+
+```bash
+# Start Redis (or point REDIS_URL at an existing instance)
+docker run --rm -d -p 6379:6379 redis:8
+
+# Quick smoke test — 500 jobs, 2 workers, db 0
+./target/release/sidekiq-bench \
+  --url redis://127.0.0.1:6379/0 \
+  --workers 2 \
+  --jobs 500 \
+  --output -
 ```
 
 ## Branch naming
@@ -38,14 +53,31 @@ Example: `feat/add-pipeline-mode`
 
 ## Testing
 
-- All new behaviour must be covered by tests.
-- Existing tests must pass: run the test suite locally before opening a PR.
-- Coverage should not decrease.
+All new behaviour must be covered by tests. Existing tests must pass before opening a PR. Run the full suite locally:
 
-<!-- TODO: add the exact test command for this repo -->
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+```
+
+For a full end-to-end smoke test (requires a running Redis on `127.0.0.1:6379`):
+
+```bash
+cargo run --release -- \
+  --url redis://127.0.0.1:6379/0 \
+  --workers 2 \
+  --jobs 500 \
+  --timeout 60 \
+  --output /tmp/smoke.json \
+  --quiet \
+  --tag smoke
+```
+
+Coverage should not decrease.
 
 ## Review process
 
 - At least one maintainer approval is required before merge.
-- CI must be green.
+- CI must be green (format check, clippy, unit tests, smoke test all pass).
 - Maintainers may request changes or close PRs that don't meet the bar — this is normal and not personal.
