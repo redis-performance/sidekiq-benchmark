@@ -51,13 +51,13 @@ jobs:
             --workers 2 \
             --jobs 500 \
             --timeout 60 \
-            --output - \
+            --output /tmp/smoke.json \
             --quiet \
-            --tag smoke \
-          | tee /tmp/smoke.json
+            --tag smoke
           # Verify the run completed all jobs without timing out
           jq -e '
             .results[0].total_jobs == 500 and
             .results[0].timed_out == false and
+            .results[0].errors == 0 and
             .results[0].latency_us.total_count == 500
           ' /tmp/smoke.json
