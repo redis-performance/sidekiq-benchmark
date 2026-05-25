@@ -92,7 +92,7 @@ struct JsonConfig<'a> {
     url: &'a str, // redacted — password replaced with ****
     workers: &'a [usize],
     jobs_per_trial: u64,
-    queue: &'a str,
+    queues: &'a [String],
     warmup_jobs: u64,
 }
 
@@ -115,7 +115,7 @@ pub fn write_json(
     display_url: &str, // redacted form — never contains a real password
     workers: &[usize],
     jobs_per_trial: u64,
-    queue: &str,
+    queues: &[String],
     warmup_jobs: u64,
     output: &str,
 ) -> Result<()> {
@@ -127,7 +127,7 @@ pub fn write_json(
             url: display_url,
             workers,
             jobs_per_trial,
-            queue,
+            queues,
             warmup_jobs,
         },
         results: results

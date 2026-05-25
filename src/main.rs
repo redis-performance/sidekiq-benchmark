@@ -59,9 +59,15 @@ struct Cli {
     #[arg(long, default_value = "0")]
     warmup_jobs: u64,
 
-    /// Sidekiq queue name
+    /// Base Sidekiq queue name
     #[arg(long, default_value = "default")]
     queue: String,
+
+    /// Number of queues to distribute jobs across (1 = single queue, matching bin/sidekiqload;
+    /// 2–8 matches common production patterns and shows Dragonfly's multi-queue advantage).
+    /// Queue names are generated as <queue>_0, <queue>_1, … when > 1.
+    #[arg(long, default_value = "1")]
+    num_queues: usize,
 
     /// Label for output (defaults to redis_version from INFO)
     #[arg(long)]
@@ -161,6 +167,16 @@ fn validate_output_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Generate queue names from a base name and count.
+/// With n=1 returns `["default"]`; with n=4 returns `["default_0".."default_3"]`.
+fn make_queue_names(base: &str, n: usize) -> Vec<String> {
+    if n <= 1 {
+        vec![base.to_string()]
+    } else {
+        (0..n).map(|i| format!("{base}_{i}")).collect()
+    }
+}
+
 async fn fetch_tag(url: &str) -> String {
     let client = match redis::Client::open(url) {
         Ok(c) => c,
@@ -201,7 +217,7 @@ async fn fetch_tag(url: &str) -> String {
 
 struct TrialConfig<'a> {
     url: &'a str,
-    queue: &'a str,
+    queues: &'a [String],
     jobs: u64,
     timeout_secs: u64,
     quiet: bool,
@@ -247,7 +263,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         target_jobs: cfg.jobs,
     };
 
-    let mut processor = sidekiq::Processor::new(redis_pool, vec![cfg.queue.to_string()])
+    let mut processor = sidekiq::Processor::new(redis_pool, cfg.queues.to_vec())
         .with_config(sidekiq::ProcessorConfig::default().num_workers(n_workers));
     processor.register(w);
 
@@ -361,6 +377,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
+    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
@@ -393,8 +410,25 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("sidekiq_bench_{tag}.json"));
 
+    let queue_names = make_queue_names(&cli.queue, cli.num_queues);
+    let queues_label = if queue_names.len() == 1 {
+        queue_names[0].clone()
+    } else {
+        format!(
+            "{} queues ({}…{})",
+            queue_names.len(),
+            queue_names[0],
+            queue_names[queue_names.len() - 1]
+        )
+    };
+
     println!("\n=== sidekiq-bench — {tag} ===");
-    println!("    {}  jobs={}", display_url, report::format_n(cli.jobs));
+    println!(
+        "    {}  jobs={}  queues={}",
+        display_url,
+        report::format_n(cli.jobs),
+        queues_label
+    );
     println!();
 
     let client = redis::Client::open(url.as_str()).context("invalid Redis URL")?;
@@ -405,7 +439,7 @@ async fn main() -> Result<()> {
 
     let cfg = TrialConfig {
         url: &url,
-        queue: &cli.queue,
+        queues: &queue_names,
         jobs: cli.jobs,
         timeout_secs: cli.timeout,
         quiet: cli.quiet,
@@ -433,16 +467,16 @@ async fn main() -> Result<()> {
 
     for &n_workers in &workers_list {
         if cli.warmup_jobs > 0 {
-            pre_trial_clear(&mut conn, &cli.queue, cli.allow_flushdb).await?;
-            producer::bulk_enqueue(&mut conn, &cli.queue, cli.warmup_jobs).await?;
+            pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
+            producer::bulk_enqueue(&mut conn, &queue_names, cli.warmup_jobs).await?;
             if !cli.quiet {
                 print!("  [{n_workers:>4} workers] warmup … ");
             }
             run_trial(&warmup_cfg, n_workers).await?;
         }
 
-        pre_trial_clear(&mut conn, &cli.queue, cli.allow_flushdb).await?;
-        producer::bulk_enqueue(&mut conn, &cli.queue, cli.jobs).await?;
+        pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
+        producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs).await?;
 
         if !cli.quiet {
             print!("  [{n_workers:>4} workers] ");
@@ -465,7 +499,7 @@ async fn main() -> Result<()> {
         &display_url,
         &workers_list,
         cli.jobs,
-        &cli.queue,
+        &queue_names,
         cli.warmup_jobs,
         &output,
     )?;
@@ -478,16 +512,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Clear the queue before a trial. Uses DEL by default; FLUSHDB only when explicitly allowed.
+/// Clear queues before a trial. Uses DEL by default; FLUSHDB only when explicitly allowed.
 async fn pre_trial_clear(
     conn: &mut redis::aio::MultiplexedConnection,
-    queue: &str,
+    queues: &[String],
     allow_flushdb: bool,
 ) -> Result<()> {
     if allow_flushdb {
         producer::flushdb(conn).await
     } else {
-        producer::clear_queue(conn, queue).await
+        producer::clear_queue(conn, queues).await
     }
 }
 
@@ -556,6 +590,7 @@ mod tests {
             jobs: 1000,
             warmup_jobs: 0,
             queue: "default".into(),
+            num_queues: 1,
             tag: None,
             output: None,
             timeout: 300,
@@ -585,6 +620,7 @@ mod tests {
             jobs: 1000,
             warmup_jobs: 0,
             queue: "default".into(),
+            num_queues: 1,
             tag: None,
             output: None,
             timeout: 300,
@@ -608,6 +644,7 @@ mod tests {
             jobs: 1000,
             warmup_jobs: 0,
             queue: "default".into(),
+            num_queues: 1,
             tag: None,
             output: None,
             timeout: 300,
