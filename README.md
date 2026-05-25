@@ -26,9 +26,17 @@ shutdown.
 
 ### Docker Hub
 
+> **Memory:** the default run pre-fills 500,000 jobs (~300 B each) → **~143 MB**
+> peak Redis memory before workers drain the queue. Use `--jobs 50000` (~14 MB)
+> for a quick local smoke test.
+
 ```bash
 # Run against local Redis (default: db 13, 500k jobs, workers 10/50/100/200)
 docker run --rm --network host redis/sidekiq-benchmark
+
+# Lighter local run (~14 MB Redis memory)
+docker run --rm --network host redis/sidekiq-benchmark \
+  --workers 10,50 --jobs 50000
 
 # Custom settings
 docker run --rm --network host redis/sidekiq-benchmark \
