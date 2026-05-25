@@ -1,5 +1,10 @@
 # sidekiq-benchmark
 
+[![CI](https://github.com/redis-performance/sidekiq-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/redis-performance/sidekiq-benchmark/actions/workflows/ci.yml)
+[![Docker Pulls](https://img.shields.io/docker/pulls/redis/sidekiq-benchmark)](https://hub.docker.com/r/redis/sidekiq-benchmark)
+[![Docker Image Size](https://img.shields.io/docker/image-size/redis/sidekiq-benchmark/latest)](https://hub.docker.com/r/redis/sidekiq-benchmark)
+[![Docker Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-blue)](https://hub.docker.com/r/redis/sidekiq-benchmark)
+
 A Sidekiq protocol load benchmark written in Rust. Measures job throughput and
 full latency spectrum (p50→p99.99) against any Redis endpoint.
 
