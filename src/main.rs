@@ -312,6 +312,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let redis_pool = bb8::Pool::builder()
         .max_size(n_workers as u32 + 4) // +4 for internal sidekiq bookkeeping tasks
         .connection_timeout(Duration::from_secs(10))
+        .test_on_check_out(false) // avoid a PING per job dequeue — connections are always live
         .build(manager)
         .await
         .context("failed to build Redis connection pool")?;
