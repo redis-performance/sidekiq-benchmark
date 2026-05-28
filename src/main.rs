@@ -294,15 +294,50 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
 
-    // Histogram collector — drains the latency channel and builds a HDR histogram.
+    // Per-second latency snapshot, published by the collector task once per
+    // second and read by the monitor task. Single writer (collector), single
+    // reader (monitor) — no contention.
+    let (per_sec_tx, per_sec_rx) = watch::channel::<Histogram<u64>>(empty_histogram());
+
+    // Histogram collector — drains the latency channel and maintains BOTH the
+    // trial-long HDR histogram (returned at end) and a rolling per-second
+    // window histogram (published via per_sec_tx every 1 s, then reset).
+    //
+    // Workers used to update the per-second histogram directly via a shared
+    // `Mutex<Histogram>`. At 100+ workers that lock dominated the hot path
+    // and capped throughput at ~4× below the engine's actual ceiling. By
+    // serializing all latency events through this single collector task we
+    // avoid the mutex entirely.
+    //
     // Channel closes when all latency_tx clones are dropped (main sentinel + worker clones).
     let collector = tokio::spawn(async move {
         let mut hist = empty_histogram();
+        let mut per_sec_hist = empty_histogram();
         let mut rx = latency_rx;
-        while let Some(us) = rx.recv().await {
-            // Lower bound is 0; clamp to 1 so every sample falls within [1, max_value]
-            let _ = hist.record(us.max(1));
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // First tick fires immediately; skip it so the first published snapshot
+        // captures a full second of data.
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                maybe_us = rx.recv() => {
+                    match maybe_us {
+                        Some(us) => {
+                            let v = us.max(1);
+                            let _ = hist.record(v);
+                            let _ = per_sec_hist.record(v);
+                        }
+                        None => break,
+                    }
+                }
+                _ = interval.tick() => {
+                    let _ = per_sec_tx.send(per_sec_hist.clone());
+                    per_sec_hist.reset();
+                }
+            }
         }
+        // Final snapshot for any trailing data the monitor hasn't drained.
+        let _ = per_sec_tx.send(per_sec_hist);
         hist
     });
 
@@ -345,6 +380,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let metrics_mon = metrics.clone();
     let specs_for_monitor = cfg.percentile_specs.to_vec();
     let quiet = cfg.quiet;
+    let mut per_sec_rx_mon = per_sec_rx;
 
     let monitor = tokio::spawn(async move {
         let mut prev_completed = 0u64;
@@ -366,7 +402,12 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
                 v.push(err_delta);
             }
 
-            let snap = metrics_mon.drain_per_sec();
+            // Read the most recent per-second histogram snapshot published by
+            // the collector task (lockless via tokio::sync::watch).
+            // `borrow_and_update` clears the "changed" flag so we read fresh
+            // data on every tick — works even if no new snapshot arrived
+            // (rare; the collector publishes once per second).
+            let snap = per_sec_rx_mon.borrow_and_update().clone();
             if let Ok(mut map) = lat_for_monitor.lock() {
                 for spec in &specs_for_monitor {
                     map.entry(spec.name().to_string())
