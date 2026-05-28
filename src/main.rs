@@ -4,6 +4,9 @@ mod producer;
 mod report;
 mod worker;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use hdrhistogram::Histogram;
