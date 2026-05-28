@@ -11,7 +11,7 @@ use metrics::{LatencyStats, Metrics, TrialResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -294,30 +294,32 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
 
-    // Per-second latency snapshot, published by the collector task once per
-    // second and read by the monitor task. Single writer (collector), single
-    // reader (monitor) — no contention.
-    let (per_sec_tx, per_sec_rx) = watch::channel::<Histogram<u64>>(empty_histogram());
+    // Per-second latency windows are pulled by the monitor, not pushed on a
+    // separate timer: each tick the monitor sends a oneshot responder over
+    // `snapshot_tx`, and the collector replies with the current window histogram
+    // and resets it. Driving the reset from the monitor's clock keeps the latency
+    // window aligned with the throughput/error deltas measured on that same tick,
+    // so latency_per_sec[i] and throughput_per_sec[i] describe the same second.
+    // Single requester (monitor), single responder (collector) — no contention.
+    let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel::<oneshot::Sender<Histogram<u64>>>();
 
     // Histogram collector — drains the latency channel and maintains BOTH the
     // trial-long HDR histogram (returned at end) and a rolling per-second
-    // window histogram (published via per_sec_tx every 1 s, then reset).
+    // window histogram (cloned out and reset whenever the monitor requests it).
     //
     // Workers used to update the per-second histogram directly via a shared
     // `Mutex<Histogram>`. At 100+ workers that lock dominated the hot path
     // and capped throughput at ~4× below the engine's actual ceiling. By
     // serializing all latency events through this single collector task we
-    // avoid the mutex entirely.
+    // avoid the mutex entirely; the per-job path stays lock-free (the histogram
+    // is only cloned on the monitor's once-per-second request).
     //
     // Channel closes when all latency_tx clones are dropped (main sentinel + worker clones).
     let collector = tokio::spawn(async move {
         let mut hist = empty_histogram();
         let mut per_sec_hist = empty_histogram();
         let mut rx = latency_rx;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        // First tick fires immediately; skip it so the first published snapshot
-        // captures a full second of data.
-        interval.tick().await;
+        let mut snapshot_rx = snapshot_rx;
         loop {
             tokio::select! {
                 maybe_us = rx.recv() => {
@@ -330,14 +332,17 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
                         None => break,
                     }
                 }
-                _ = interval.tick() => {
-                    let _ = per_sec_tx.send(per_sec_hist.clone());
+                // Monitor asks for the latency it accumulated since the last tick.
+                // Reply with a clone and reset, so the next window starts empty.
+                // When the monitor task is aborted at trial end, snapshot_tx drops
+                // and recv() yields None; the pattern stops matching, disabling this
+                // branch so the loop keeps draining rx until the channel closes.
+                Some(resp) = snapshot_rx.recv() => {
+                    let _ = resp.send(per_sec_hist.clone());
                     per_sec_hist.reset();
                 }
             }
         }
-        // Final snapshot for any trailing data the monitor hasn't drained.
-        let _ = per_sec_tx.send(per_sec_hist);
         hist
     });
 
@@ -380,7 +385,6 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let metrics_mon = metrics.clone();
     let specs_for_monitor = cfg.percentile_specs.to_vec();
     let quiet = cfg.quiet;
-    let mut per_sec_rx_mon = per_sec_rx;
 
     let monitor = tokio::spawn(async move {
         let mut prev_completed = 0u64;
@@ -402,17 +406,21 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
                 v.push(err_delta);
             }
 
-            // Read the most recent per-second histogram snapshot published by
-            // the collector task (lockless via tokio::sync::watch).
-            // `borrow_and_update` clears the "changed" flag so we read fresh
-            // data on every tick — works even if no new snapshot arrived
-            // (rare; the collector publishes once per second).
-            let snap = per_sec_rx_mon.borrow_and_update().clone();
-            if let Ok(mut map) = lat_for_monitor.lock() {
-                for spec in &specs_for_monitor {
-                    map.entry(spec.name().to_string())
-                        .or_default()
-                        .push(spec.value(&snap));
+            // Pull the latency window the collector accumulated since the last
+            // tick. Requesting it here — on the same clock that just measured the
+            // throughput/error deltas — keeps latency_per_sec[i] aligned with
+            // throughput_per_sec[i]. If the collector has already finished (its
+            // channel closed before this tick), skip the sample for this second.
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if snapshot_tx.send(resp_tx).is_ok() {
+                if let Ok(snap) = resp_rx.await {
+                    if let Ok(mut map) = lat_for_monitor.lock() {
+                        for spec in &specs_for_monitor {
+                            map.entry(spec.name().to_string())
+                                .or_default()
+                                .push(spec.value(&snap));
+                        }
+                    }
                 }
             }
 
