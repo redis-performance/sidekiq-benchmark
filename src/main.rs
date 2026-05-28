@@ -11,7 +11,7 @@ use metrics::{LatencyStats, Metrics, TrialResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -294,14 +294,54 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
 
-    // Histogram collector — drains the latency channel and builds a HDR histogram.
+    // Per-second latency windows are pulled by the monitor, not pushed on a
+    // separate timer: each tick the monitor sends a oneshot responder over
+    // `snapshot_tx`, and the collector replies with the current window histogram
+    // and resets it. Driving the reset from the monitor's clock keeps the latency
+    // window aligned with the throughput/error deltas measured on that same tick,
+    // so latency_per_sec[i] and throughput_per_sec[i] describe the same second.
+    // Single requester (monitor), single responder (collector) — no contention.
+    let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel::<oneshot::Sender<Histogram<u64>>>();
+
+    // Histogram collector — drains the latency channel and maintains BOTH the
+    // trial-long HDR histogram (returned at end) and a rolling per-second
+    // window histogram (cloned out and reset whenever the monitor requests it).
+    //
+    // Workers used to update the per-second histogram directly via a shared
+    // `Mutex<Histogram>`. At 100+ workers that lock dominated the hot path
+    // and capped throughput at ~4× below the engine's actual ceiling. By
+    // serializing all latency events through this single collector task we
+    // avoid the mutex entirely; the per-job path stays lock-free (the histogram
+    // is only cloned on the monitor's once-per-second request).
+    //
     // Channel closes when all latency_tx clones are dropped (main sentinel + worker clones).
     let collector = tokio::spawn(async move {
         let mut hist = empty_histogram();
+        let mut per_sec_hist = empty_histogram();
         let mut rx = latency_rx;
-        while let Some(us) = rx.recv().await {
-            // Lower bound is 0; clamp to 1 so every sample falls within [1, max_value]
-            let _ = hist.record(us.max(1));
+        let mut snapshot_rx = snapshot_rx;
+        loop {
+            tokio::select! {
+                maybe_us = rx.recv() => {
+                    match maybe_us {
+                        Some(us) => {
+                            let v = us.max(1);
+                            let _ = hist.record(v);
+                            let _ = per_sec_hist.record(v);
+                        }
+                        None => break,
+                    }
+                }
+                // Monitor asks for the latency it accumulated since the last tick.
+                // Reply with a clone and reset, so the next window starts empty.
+                // When the monitor task is aborted at trial end, snapshot_tx drops
+                // and recv() yields None; the pattern stops matching, disabling this
+                // branch so the loop keeps draining rx until the channel closes.
+                Some(resp) = snapshot_rx.recv() => {
+                    let _ = resp.send(per_sec_hist.clone());
+                    per_sec_hist.reset();
+                }
+            }
         }
         hist
     });
@@ -366,12 +406,21 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
                 v.push(err_delta);
             }
 
-            let snap = metrics_mon.drain_per_sec();
-            if let Ok(mut map) = lat_for_monitor.lock() {
-                for spec in &specs_for_monitor {
-                    map.entry(spec.name().to_string())
-                        .or_default()
-                        .push(spec.value(&snap));
+            // Pull the latency window the collector accumulated since the last
+            // tick. Requesting it here — on the same clock that just measured the
+            // throughput/error deltas — keeps latency_per_sec[i] aligned with
+            // throughput_per_sec[i]. If the collector has already finished (its
+            // channel closed before this tick), skip the sample for this second.
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if snapshot_tx.send(resp_tx).is_ok() {
+                if let Ok(snap) = resp_rx.await {
+                    if let Ok(mut map) = lat_for_monitor.lock() {
+                        for spec in &specs_for_monitor {
+                            map.entry(spec.name().to_string())
+                                .or_default()
+                                .push(spec.value(&snap));
+                        }
+                    }
                 }
             }
 
