@@ -52,6 +52,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # URL parsing — safe password encoding and redaction
 url = "2"
 
+# Global allocator: ~4x throughput on alpine/musl, ~5–15% on glibc.
+mimalloc = { version = "0.1", default-features = false }
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -1,18 +1,14 @@
 use hdrhistogram::Histogram;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Shared counters updated atomically by worker tasks.
-///
-/// Note: per-second latency windowing is intentionally NOT stored here. It used
-/// to be a `Mutex<Histogram>` on which every worker contended for every job;
-/// at 100+ workers that lock became the dominant throughput bottleneck (~4×
-/// degradation at saturation). It now lives inside the collector task in
-/// `main.rs`, which is the sole writer for both the trial-long and the
-/// per-second histograms — no mutex on the worker hot path.
 pub struct Metrics {
     pub completed: AtomicU64,
     pub errors: AtomicU64,
+    /// Short-lived histogram drained every second by the monitor task.
+    per_sec_hist: Mutex<Histogram<u64>>,
 }
 
 impl Metrics {
@@ -20,6 +16,10 @@ impl Metrics {
         Self {
             completed: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            per_sec_hist: Mutex::new(
+                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
+                    .expect("valid histogram bounds"),
+            ),
         }
     }
 
@@ -40,6 +40,22 @@ impl Metrics {
 
     pub fn get_errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
+    }
+
+    /// Record a latency sample (µs) into the per-second window histogram.
+    pub fn record_latency_per_sec(&self, us: u64) {
+        if let Ok(mut h) = self.per_sec_hist.lock() {
+            let _ = h.record(us.max(1));
+        }
+    }
+
+    /// Snapshot and reset the per-second window histogram.
+    /// Called by the monitor task once per second.
+    pub fn drain_per_sec(&self) -> Histogram<u64> {
+        let mut g = self.per_sec_hist.lock().unwrap();
+        let snap = g.clone();
+        g.reset();
+        snap
     }
 }
 
@@ -131,5 +147,18 @@ mod tests {
         assert_eq!(m.inc_completed(), 1);
         assert_eq!(m.inc_completed(), 2);
         assert_eq!(m.get_completed(), 2);
+    }
+
+    #[test]
+    fn drain_per_sec_snapshots_and_resets() {
+        let m = Metrics::new();
+        m.record_latency_per_sec(100);
+        m.record_latency_per_sec(200);
+        m.record_latency_per_sec(300);
+        let snap = m.drain_per_sec();
+        assert_eq!(snap.len(), 3);
+        // Second drain should be empty
+        let empty = m.drain_per_sec();
+        assert!(empty.is_empty());
     }
 }
