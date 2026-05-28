@@ -41,9 +41,8 @@ impl sidekiq::Worker<serde_json::Value> for LoadWorker {
             };
             // Clamp to 1 µs minimum so the value is always within the histogram's lower bound
             let clamped = latency_us.max(1);
-            // The collector task in main.rs owns both the trial-long and the
-            // per-second histograms (no shared mutex on the worker hot path).
             let _ = self.latency_tx.send(clamped);
+            self.metrics.record_latency_per_sec(clamped);
         } else {
             self.metrics.inc_error();
         }
