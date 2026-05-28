@@ -132,5 +132,4 @@ mod tests {
         assert_eq!(m.inc_completed(), 2);
         assert_eq!(m.get_completed(), 2);
     }
-
 }
