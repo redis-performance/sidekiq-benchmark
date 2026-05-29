@@ -101,7 +101,7 @@ struct Cli {
 
     /// ASCII filler bytes in each job's args[0]. Default 6 matches the
     /// historical `"string"` placeholder length (same wire size as pre-flag).
-    /// Envelope alone is ~250 B, so 700 → ~1 KB total job; 3800 → ~4 KB.
+    /// Envelope is ~200 B, so 800 → ~1 KB total job; 3800 → ~4 KB.
     #[arg(long, default_value = "6")]
     payload_size: usize,
 }

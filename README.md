@@ -99,7 +99,7 @@ cargo build --release
 | `--warmup-jobs` | — | `0` | Warmup pass before each trial (0 = skip) |
 | `--queue` | — | `default` | Base Sidekiq queue name |
 | `--num-queues` | — | `1` | Number of queues (jobs distributed round-robin); names are `<queue>_0…<queue>_{N-1}` when N > 1 |
-| `--payload-size` | — | `6` | ASCII filler bytes in each job's `args[0]`. Default `6` matches the historical `"string"` placeholder length (~250 B serialized job). Use `~700` for ~1 KB jobs; `~3800` for ~4 KB. |
+| `--payload-size` | — | `6` | ASCII filler bytes in each job's `args[0]`. Default `6` matches the historical `"string"` placeholder length (~200 B serialized job). Envelope is ~200 B, so use `~800` for ~1 KB jobs; `~3800` for ~4 KB. |
 | `--latency-percentiles` | — | `p50,p90,p99,p999,max` | Per-second latency series to record; supports `p50`, `p75`, `p90`, `p95`, `p99`, `p999`, `p9999`, `max`, `mean` |
 | `--tag` | — | from Redis `INFO` | Label for output filename and JSON |
 | `--output` | — | `sidekiq_bench_<tag>.json` | JSON output path; `-` for stdout |
