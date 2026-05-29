@@ -18,18 +18,27 @@ pub struct SidekiqJob {
 }
 
 impl SidekiqJob {
-    pub fn new(queue: &str, idx: u64) -> Self {
+    /// `payload_size` controls the byte length of `args[0]`:
+    ///   * 0  → keeps the literal `"string"` placeholder (~6 bytes; backwards-compatible default)
+    ///   * N  → replaces with `N` ASCII filler bytes (use ~700 for total serialized job ~1 KB)
+    pub fn new(queue: &str, idx: u64, payload_size: usize) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch");
         let enqueued_at_ns = now.as_nanos() as u64;
         let enqueued_at_secs = now.as_secs_f64();
 
+        let arg0 = if payload_size == 0 {
+            "string".to_string()
+        } else {
+            "a".repeat(payload_size)
+        };
+
         SidekiqJob {
             class: "LoadWorker".to_string(),
             jid: new_jid(),
             args: vec![
-                serde_json::Value::String("string".to_string()),
+                serde_json::Value::String(arg0),
                 serde_json::Value::Number(idx.into()),
                 serde_json::json!({"mike": "bob"}),
                 serde_json::Value::Number(enqueued_at_ns.into()),
@@ -68,11 +77,22 @@ mod tests {
 
     #[test]
     fn job_args_roundtrip() {
-        let job = SidekiqJob::new("default", 42);
+        let job = SidekiqJob::new("default", 42, 0);
         let json = serde_json::to_string(&job).unwrap();
         let back: SidekiqJob = serde_json::from_str(&json).unwrap();
         assert_eq!(back.jid.len(), 24);
+        assert_eq!(back.args[0].as_str().unwrap(), "string");
         assert_eq!(back.args[1].as_u64().unwrap(), 42);
         assert!(SidekiqJob::enqueued_at_ns(&serde_json::Value::Array(back.args)).is_some());
+    }
+
+    #[test]
+    fn payload_size_grows_args0() {
+        let job = SidekiqJob::new("default", 0, 700);
+        assert_eq!(job.args[0].as_str().unwrap().len(), 700);
+        let json = serde_json::to_string(&job).unwrap();
+        // Serialized job should be roughly payload_size + ~200 bytes of envelope.
+        assert!(json.len() > 700);
+        assert!(json.len() < 1100);
     }
 }

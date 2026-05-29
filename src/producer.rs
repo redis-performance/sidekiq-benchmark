@@ -26,10 +26,12 @@ pub async fn flushdb(conn: &mut redis::aio::MultiplexedConnection) -> Result<()>
 
 /// Bulk-enqueue `n_jobs` Sidekiq jobs distributed round-robin across `queues`.
 /// Also registers every queue in the `queues` set for Sidekiq-web visibility.
+/// `payload_size` sets each job's `args[0]` byte length (0 = default "string").
 pub async fn bulk_enqueue(
     conn: &mut redis::aio::MultiplexedConnection,
     queues: &[String],
     n_jobs: u64,
+    payload_size: usize,
 ) -> Result<()> {
     // Register all queues for Sidekiq-web and monitoring tools
     let mut sadd_pipe = redis::pipe();
@@ -48,7 +50,7 @@ pub async fn bulk_enqueue(
 
         for j in 0..batch {
             let queue = &queues[((idx + j as u64) % n_queues) as usize];
-            let job = SidekiqJob::new(queue, idx + j as u64);
+            let job = SidekiqJob::new(queue, idx + j as u64, payload_size);
             let payload = serde_json::to_string(&job)?;
             pipe.lpush(format!("queue:{queue}"), payload).ignore();
         }
