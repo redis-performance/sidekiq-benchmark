@@ -99,10 +99,10 @@ struct Cli {
     #[arg(long, env = "SIDEKIQ_BENCH_ALLOW_FLUSHDB")]
     allow_flushdb: bool,
 
-    /// Bytes of filler in each job's args[0]. 0 (default) keeps the literal
-    /// "string" placeholder, which serializes to ~250-300 B per job. Set to
-    /// ~700 for total job size ~1 KB; ~3800 for ~4 KB. Filler is ASCII 'a'.
-    #[arg(long, default_value = "0")]
+    /// ASCII filler bytes in each job's args[0]. Default 6 matches the
+    /// historical `"string"` placeholder length (same wire size as pre-flag).
+    /// Envelope alone is ~250 B, so 700 → ~1 KB total job; 3800 → ~4 KB.
+    #[arg(long, default_value = "6")]
     payload_size: usize,
 }
 
@@ -653,6 +653,13 @@ impl<'a> Clone for TrialConfig<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_size_default_matches_legacy_string_length() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
+        assert_eq!(cli.payload_size, 6);
+    }
 
     #[test]
     fn sanitize_tag_strips_unsafe_chars() {

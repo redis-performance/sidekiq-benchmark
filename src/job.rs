@@ -18,27 +18,20 @@ pub struct SidekiqJob {
 }
 
 impl SidekiqJob {
-    /// `payload_size` controls the byte length of `args[0]`:
-    ///   * 0  → keeps the literal `"string"` placeholder (~6 bytes; backwards-compatible default)
-    ///   * N  → replaces with `N` ASCII filler bytes (use ~700 for total serialized job ~1 KB)
-    pub fn new(queue: &str, idx: u64, payload_size: usize) -> Self {
+    /// `arg0` is the prebuilt `args[0]` filler (see `build_arg0`) — hoisted
+    /// out of the per-job loop since it's identical across the sweep.
+    pub fn new(queue: &str, idx: u64, arg0: &str) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock before epoch");
         let enqueued_at_ns = now.as_nanos() as u64;
         let enqueued_at_secs = now.as_secs_f64();
 
-        let arg0 = if payload_size == 0 {
-            "string".to_string()
-        } else {
-            "a".repeat(payload_size)
-        };
-
         SidekiqJob {
             class: "LoadWorker".to_string(),
             jid: new_jid(),
             args: vec![
-                serde_json::Value::String(arg0),
+                serde_json::Value::String(arg0.to_string()),
                 serde_json::Value::Number(idx.into()),
                 serde_json::json!({"mike": "bob"}),
                 serde_json::Value::Number(enqueued_at_ns.into()),
@@ -48,6 +41,11 @@ impl SidekiqJob {
             created_at: enqueued_at_secs,
             enqueued_at: enqueued_at_secs,
         }
+    }
+
+    /// `args[0]` filler: N ASCII bytes (≈700 yields a ~1 KB serialized job).
+    pub fn build_arg0(payload_size: usize) -> String {
+        "a".repeat(payload_size)
     }
 
     /// Extract the enqueue timestamp embedded in args[3] (nanoseconds since epoch).
@@ -77,18 +75,25 @@ mod tests {
 
     #[test]
     fn job_args_roundtrip() {
-        let job = SidekiqJob::new("default", 42, 0);
+        let job = SidekiqJob::new("default", 42, "");
         let json = serde_json::to_string(&job).unwrap();
         let back: SidekiqJob = serde_json::from_str(&json).unwrap();
         assert_eq!(back.jid.len(), 24);
-        assert_eq!(back.args[0].as_str().unwrap(), "string");
+        assert_eq!(back.args[0].as_str().unwrap(), "");
         assert_eq!(back.args[1].as_u64().unwrap(), 42);
         assert!(SidekiqJob::enqueued_at_ns(&serde_json::Value::Array(back.args)).is_some());
     }
 
     #[test]
-    fn payload_size_grows_args0() {
-        let job = SidekiqJob::new("default", 0, 700);
+    fn build_arg0_zero_is_empty() {
+        assert_eq!(SidekiqJob::build_arg0(0), "");
+    }
+
+    #[test]
+    fn build_arg0_grows_to_payload_size() {
+        let filler = SidekiqJob::build_arg0(700);
+        assert_eq!(filler.len(), 700);
+        let job = SidekiqJob::new("default", 0, &filler);
         assert_eq!(job.args[0].as_str().unwrap().len(), 700);
         let json = serde_json::to_string(&job).unwrap();
         // Serialized job should be roughly payload_size + ~200 bytes of envelope.

@@ -40,6 +40,7 @@ pub async fn bulk_enqueue(
     }
     sadd_pipe.query_async::<()>(conn).await?;
 
+    let arg0 = SidekiqJob::build_arg0(payload_size);
     let n_queues = queues.len() as u64;
     let mut idx = 0u64;
     let mut remaining = n_jobs;
@@ -50,7 +51,7 @@ pub async fn bulk_enqueue(
 
         for j in 0..batch {
             let queue = &queues[((idx + j as u64) % n_queues) as usize];
-            let job = SidekiqJob::new(queue, idx + j as u64, payload_size);
+            let job = SidekiqJob::new(queue, idx + j as u64, &arg0);
             let payload = serde_json::to_string(&job)?;
             pipe.lpush(format!("queue:{queue}"), payload).ignore();
         }
