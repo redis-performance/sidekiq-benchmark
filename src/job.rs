@@ -9,7 +9,7 @@ pub struct SidekiqJob {
     pub class: String,
     pub jid: String,
     /// args[3] carries enqueued_at_ns (u64 nanoseconds since epoch) for latency measurement.
-    /// Full layout: ["string", idx, {"mike":"bob"}, enqueued_at_ns]
+    /// Full layout: [arg0_filler, idx, {"mike":"bob"}, enqueued_at_ns]
     pub args: Vec<serde_json::Value>,
     pub queue: String,
     pub retry: serde_json::Value, // matches Ruby retry: 1 (retry once on failure)

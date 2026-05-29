@@ -19,7 +19,7 @@ pub struct LoadWorker {
 #[async_trait]
 impl sidekiq::Worker<serde_json::Value> for LoadWorker {
     /// Called by rusty-sidekiq after BRPOP dequeues a job.
-    /// `args` is the JSON array from the job payload: ["string", idx, {"mike":"bob"}, enqueued_at_ns]
+    /// `args` is the JSON array from the job payload: [arg0_filler, idx, {"mike":"bob"}, enqueued_at_ns]
     async fn perform(&self, args: serde_json::Value) -> sidekiq::Result<()> {
         // args[3] carries enqueued_at_ns (u64 nanoseconds since epoch)
         if let Some(enqueued_at_ns) = args

@@ -26,7 +26,7 @@ pub async fn flushdb(conn: &mut redis::aio::MultiplexedConnection) -> Result<()>
 
 /// Bulk-enqueue `n_jobs` Sidekiq jobs distributed round-robin across `queues`.
 /// Also registers every queue in the `queues` set for Sidekiq-web visibility.
-/// `payload_size` sets each job's `args[0]` byte length (0 = default "string").
+/// `payload_size` sets each job's `args[0]` byte length (0 = empty).
 pub async fn bulk_enqueue(
     conn: &mut redis::aio::MultiplexedConnection,
     queues: &[String],
