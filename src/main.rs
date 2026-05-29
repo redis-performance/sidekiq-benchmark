@@ -98,6 +98,12 @@ struct Cli {
     /// Default: only deletes the specific queue key, which is safe on shared Redis.
     #[arg(long, env = "SIDEKIQ_BENCH_ALLOW_FLUSHDB")]
     allow_flushdb: bool,
+
+    /// ASCII filler bytes in each job's args[0]. Default 6 matches the
+    /// historical `"string"` placeholder length (same wire size as pre-flag).
+    /// Envelope is ~200 B, so 800 → ~1 KB total job; 3800 → ~4 KB.
+    #[arg(long, default_value = "6")]
+    payload_size: usize,
 }
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
@@ -577,7 +583,8 @@ async fn main() -> Result<()> {
     for &n_workers in &workers_list {
         if cli.warmup_jobs > 0 {
             pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
-            producer::bulk_enqueue(&mut conn, &queue_names, cli.warmup_jobs).await?;
+            producer::bulk_enqueue(&mut conn, &queue_names, cli.warmup_jobs, cli.payload_size)
+                .await?;
             if !cli.quiet {
                 print!("  [{n_workers:>4} workers] warmup … ");
             }
@@ -585,7 +592,7 @@ async fn main() -> Result<()> {
         }
 
         pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
-        producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs).await?;
+        producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs, cli.payload_size).await?;
 
         if !cli.quiet {
             print!("  [{n_workers:>4} workers] ");
@@ -648,6 +655,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn payload_size_default_matches_legacy_string_length() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
+        assert_eq!(cli.payload_size, 6);
+    }
+
+    #[test]
     fn sanitize_tag_strips_unsafe_chars() {
         assert_eq!(sanitize_tag("redis-8.0"), "redis-8.0"); // dots and dashes kept
         assert_eq!(sanitize_tag("redis/8.0"), "redis-8.0"); // slash → dash
@@ -706,6 +720,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            payload_size: 0,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -737,6 +752,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            payload_size: 0,
         };
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
@@ -762,6 +778,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            payload_size: 0,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
