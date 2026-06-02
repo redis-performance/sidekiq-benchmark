@@ -131,6 +131,14 @@ struct Cli {
     /// consumer can't keep up. Default 1000 ≈ 5 ms of work at ~200K jobs/s.
     #[arg(long, default_value = "1000")]
     target_queue_depth: u64,
+
+    /// Skip the per-trial DEL of `queue:<name>` — preserves any pre-existing
+    /// backlog at trial start. Required by Phase 3 Experiment 3 (latency-vs-fill),
+    /// where the test runs a steady-state workload against a 25 / 100 / 240 GB
+    /// pre-filled list. Only meaningful with `--duration-secs`; ignored in
+    /// burst-then-drain mode (which always pre-fills its own backlog).
+    #[arg(long)]
+    no_clear: bool,
 }
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
@@ -753,11 +761,17 @@ async fn main() -> Result<()> {
         if cli.duration_secs.is_none() {
             pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
             producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs, cli.payload_size).await?;
-        } else {
+        } else if !cli.no_clear {
             // Steady-state: still clear stale backlog so the trial starts at
             // a known empty state. Producer fills as the consumer drains.
             pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
         }
+        // else: --no-clear with --duration-secs — Phase 3 Experiment 3 path.
+        // Pre-existing backlog stays; the consumer drains it from the tail
+        // while the producer LPUSHes new jobs at the head. Per-command HDR
+        // (LPUSH + BRPOP) is the meaningful measurement in this mode; the
+        // e2e histogram will skew very high (pre-fill jobs sat in queue for
+        // the full pre-fill duration before being dequeued).
 
         if !cli.quiet {
             print!("  [{n_workers:>4} workers] ");
@@ -926,6 +940,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -961,6 +976,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
@@ -990,6 +1006,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
