@@ -132,6 +132,15 @@ struct Cli {
     #[arg(long, default_value = "1000")]
     target_queue_depth: u64,
 
+    /// Steady-state mode only: number of concurrent LPUSH tasks the producer
+    /// fans out across. A single sequential LPUSH on a peered RS endpoint
+    /// caps at ~3.4K jobs/s (Phase 3 pre-flight, 2026-06-02), which starves
+    /// 2000-worker consumers; fanning out N tasks scales the producer
+    /// linearly by sharing the underlying multiplexed connection. Default
+    /// 64 sustains ~200K jobs/s comfortably.
+    #[arg(long, default_value = "64")]
+    producer_parallelism: usize,
+
     /// Skip the per-trial DEL of `queue:<name>` — preserves any pre-existing
     /// backlog at trial start. Required by Phase 3 Experiment 3 (latency-vs-fill),
     /// where the test runs a steady-state workload against a 25 / 100 / 240 GB
@@ -337,6 +346,7 @@ struct TrialConfig<'a> {
 struct SteadyStateCfg {
     duration_secs: u64,
     target_queue_depth: u64,
+    producer_parallelism: usize,
 }
 
 fn empty_histogram() -> Histogram<u64> {
@@ -434,15 +444,16 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         Some(tokio::spawn(async move {
             let client = redis::Client::open(producer_url.as_str())
                 .context("invalid Redis URL for producer")?;
-            let mut conn = client
+            let conn = client
                 .get_multiplexed_async_connection()
                 .await
                 .context("producer failed to connect to Redis")?;
             producer::stream_enqueue(
-                &mut conn,
+                conn,
                 &producer_queues,
                 payload_size,
                 ss.target_queue_depth,
+                ss.producer_parallelism,
                 producer_metrics,
                 producer_tx,
                 producer_cancel,
@@ -715,6 +726,7 @@ async fn main() -> Result<()> {
         steady_state: cli.duration_secs.map(|d| SteadyStateCfg {
             duration_secs: d,
             target_queue_depth: cli.target_queue_depth,
+            producer_parallelism: cli.producer_parallelism,
         }),
         payload_size: cli.payload_size,
     };
@@ -941,6 +953,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            producer_parallelism: 64,
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
@@ -977,6 +990,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            producer_parallelism: 64,
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
@@ -1007,6 +1021,7 @@ mod tests {
             track_stats: false,
             duration_secs: None,
             target_queue_depth: 1000,
+            producer_parallelism: 64,
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();

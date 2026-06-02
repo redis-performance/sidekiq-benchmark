@@ -1,6 +1,7 @@
 use crate::job::SidekiqJob;
 use crate::metrics::Metrics;
 use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -69,61 +70,104 @@ pub async fn bulk_enqueue(
     Ok(())
 }
 
-/// Steady-state producer: loops LPUSHing one job at a time, recording per-call
-/// latency, until the cancellation token fires. Soft-caps in-flight at
-/// `target_queue_depth` (= produced − completed) so the consumer keeps up;
-/// when at the cap, yields briefly instead of busy-spinning. Returns the
-/// total job count it managed to push (useful for diagnostics + sanity
-/// checks against the consumer's completed count).
+/// Steady-state producer: fan out `parallelism` concurrent LPUSH tasks, each
+/// owning a clone of the multiplexed Redis connection, and let them
+/// LPUSH one job per iteration with per-call HDR latency recording until
+/// the cancellation token fires.
 ///
-/// Used by Phase 3's sustained-load trials, where the goal is latency
-/// stability under continuous push+pop — not burst throughput.
+/// Soft-caps in-flight at `target_queue_depth` (= produced − completed) so
+/// the consumer keeps up; when at the cap, each task yields briefly instead
+/// of busy-spinning. Returns the total job count pushed across all tasks
+/// (useful for diagnostics + sanity checks against the consumer's completed
+/// count).
+///
+/// Parallelism rationale (Phase 3 pre-flight, 2026-06-02): a single
+/// sequential `MultiplexedConnection::LPUSH` cycles at ~290 µs RTT to a
+/// peered RS endpoint — about 3.4K jobs/s. Phase 3's 240 GB scenario needs
+/// the producer to sustain ~200K jobs/s to match a saturated single-shard
+/// consumer; fanning out N concurrent in-flight LPUSHes through the same
+/// connection (which the `redis` crate's multiplexer pipelines on the
+/// single socket) scales the producer to ~3.4K × N jobs/s. Default 64 is
+/// comfortable headroom for the 240 GB single-shard scenario.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_enqueue(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: redis::aio::MultiplexedConnection,
     queues: &[String],
     payload_size: usize,
     target_queue_depth: u64,
+    parallelism: usize,
     metrics: Arc<Metrics>,
     lpush_latency_tx: mpsc::UnboundedSender<u64>,
     cancel: CancellationToken,
 ) -> Result<u64> {
+    anyhow::ensure!(parallelism >= 1, "producer parallelism must be >= 1");
+
     // Register all queues once for Sidekiq-web / monitoring tools.
-    let mut sadd_pipe = redis::pipe();
-    for queue in queues {
-        sadd_pipe.cmd("SADD").arg("queues").arg(queue).ignore();
-    }
-    sadd_pipe.query_async::<()>(conn).await?;
-
-    let arg0 = SidekiqJob::build_arg0(payload_size);
-    let n_queues = queues.len() as u64;
-    let mut idx = 0u64;
-
-    while !cancel.is_cancelled() {
-        let done = metrics.get_completed();
-        let in_flight = idx.saturating_sub(done);
-        if in_flight >= target_queue_depth {
-            // Consumer hasn't caught up — back off a tick so we don't pile
-            // backlog and burn the producer's CPU on a spin loop.
-            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-            continue;
+    {
+        let mut sadd_conn = conn.clone();
+        let mut sadd_pipe = redis::pipe();
+        for queue in queues {
+            sadd_pipe.cmd("SADD").arg("queues").arg(queue).ignore();
         }
-
-        let queue = &queues[(idx % n_queues) as usize];
-        let job = SidekiqJob::new(queue, idx, &arg0);
-        let payload = serde_json::to_string(&job)?;
-        let key = format!("queue:{queue}");
-
-        let start = Instant::now();
-        redis::cmd("LPUSH")
-            .arg(&key)
-            .arg(payload)
-            .query_async::<i64>(conn)
-            .await?;
-        let _ = lpush_latency_tx.send(start.elapsed().as_micros().max(1) as u64);
-
-        idx += 1;
+        sadd_pipe.query_async::<()>(&mut sadd_conn).await?;
     }
 
-    Ok(idx)
+    let arg0 = Arc::new(SidekiqJob::build_arg0(payload_size));
+    let total_pushed = Arc::new(AtomicU64::new(0));
+    let queues: Arc<[String]> = Arc::from(queues.to_vec());
+    let n_queues = queues.len() as u64;
+
+    let mut handles = Vec::with_capacity(parallelism);
+    for _ in 0..parallelism {
+        let mut c = conn.clone();
+        let queues = queues.clone();
+        let arg0 = arg0.clone();
+        let metrics = metrics.clone();
+        let lpush_tx = lpush_latency_tx.clone();
+        let cancel = cancel.clone();
+        let total_pushed = total_pushed.clone();
+
+        handles.push(tokio::spawn(async move {
+            // Each task soft-caps its share of the in-flight window so the
+            // sum across all tasks respects the global target depth.
+            let per_task_cap = target_queue_depth;
+            while !cancel.is_cancelled() {
+                let done = metrics.get_completed();
+                let pushed_now = total_pushed.load(Ordering::Acquire);
+                let in_flight = pushed_now.saturating_sub(done);
+                if in_flight >= per_task_cap {
+                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    continue;
+                }
+
+                let idx = total_pushed.fetch_add(1, Ordering::AcqRel);
+                let queue = &queues[(idx % n_queues) as usize];
+                let job = SidekiqJob::new(queue, idx, arg0.as_str());
+                let payload = match serde_json::to_string(&job) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                let start = Instant::now();
+                let res = redis::cmd("LPUSH")
+                    .arg(format!("queue:{queue}"))
+                    .arg(payload)
+                    .query_async::<i64>(&mut c)
+                    .await;
+                if res.is_err() {
+                    // Producer connection died — most likely target Redis went
+                    // away. Bail this task; the consumer will detect EOF and
+                    // the trial will time out gracefully.
+                    break;
+                }
+                let _ = lpush_tx.send(start.elapsed().as_micros().max(1) as u64);
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    Ok(total_pushed.load(Ordering::Acquire))
 }
