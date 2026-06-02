@@ -312,6 +312,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let (done_tx, mut done_rx) = watch::channel(false);
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
+    let (brpop_tx, brpop_rx) = mpsc::unbounded_channel::<u64>();
 
     // Histogram collector — drains the latency channel and builds a HDR histogram.
     // Channel closes when all latency_tx clones are dropped (main sentinel + worker clones).
@@ -320,6 +321,17 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         let mut rx = latency_rx;
         while let Some(us) = rx.recv().await {
             // Lower bound is 0; clamp to 1 so every sample falls within [1, max_value]
+            let _ = hist.record(us.max(1));
+        }
+        hist
+    });
+
+    // BRPOP histogram collector — drains per-call latencies from rusty-sidekiq's
+    // fetcher. Closes when the processor and its clones drop the sender.
+    let brpop_collector = tokio::spawn(async move {
+        let mut hist = empty_histogram();
+        let mut rx = brpop_rx;
+        while let Some(us) = rx.recv().await {
             let _ = hist.record(us.max(1));
         }
         hist
@@ -346,7 +358,8 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let mut processor = sidekiq::Processor::new(redis_pool, cfg.queues.to_vec()).with_config(
         sidekiq::ProcessorConfig::default()
             .num_workers(n_workers)
-            .track_stats(cfg.track_stats),
+            .track_stats(cfg.track_stats)
+            .brpop_latency_tx(brpop_tx.clone()),
     );
     processor.register(w);
 
@@ -443,11 +456,13 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         // Processor::run() waits for in-flight workers before returning, so all worker
         // latency_tx clones are already dropped. Drop the sentinel and the channel closes.
         drop(latency_tx);
+        drop(brpop_tx);
     } else {
         // Signal graceful shutdown and give workers up to 5 s to finish current jobs.
         // Workers drop their latency_tx clones when they exit, closing the channel.
         token.cancel();
         drop(latency_tx); // drop sentinel before waiting so channel can close
+        drop(brpop_tx); // same — fetcher's clones close once Processor::run returns
         let timed_shutdown = tokio::time::timeout(Duration::from_secs(5), proc_handle).await;
         if timed_shutdown.is_err() {
             // Workers are stuck; force-abort and give the runtime a tick to clean up
@@ -456,8 +471,9 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         }
     }
 
-    // Channel is now closed — collector drains buffered values and returns the histogram
+    // Channels are now closed — collectors drain buffered values and return histograms
     let hist = collector.await.unwrap_or_else(|_| empty_histogram());
+    let brpop_hist = brpop_collector.await.unwrap_or_else(|_| empty_histogram());
 
     let total_jobs = metrics.get_completed();
     let errors = metrics.get_errors();
@@ -486,6 +502,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         errors_per_sec,
         latency_per_sec,
         latency: LatencyStats::from_histogram(&hist),
+        brpop_latency: LatencyStats::from_histogram(&brpop_hist),
         errors,
         timed_out,
     })

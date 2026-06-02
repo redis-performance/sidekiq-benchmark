@@ -49,6 +49,15 @@ pub fn print_trial_line(r: &TrialResult) {
         fmt_us(r.latency.max),
         marker,
     );
+    if r.brpop_latency.total_count > 0 {
+        println!(
+            "                       BRPOP        p50={:<8} p99={:<8} p99.9={:<8} max={}",
+            fmt_us(r.brpop_latency.p50),
+            fmt_us(r.brpop_latency.p99),
+            fmt_us(r.brpop_latency.p99_9),
+            fmt_us(r.brpop_latency.max),
+        );
+    }
 }
 
 /// Print the summary table after all trials.
@@ -108,6 +117,10 @@ struct JsonResult {
     errors_per_sec: Vec<u64>,
     latency_per_sec_us: HashMap<String, Vec<u64>>,
     latency_us: LatencyStats,
+    /// Per-BRPOP-call HDR percentiles, recorded only when work was returned
+    /// (empty-queue timeouts skipped). Empty (`total_count == 0`) when no
+    /// samples were captured — e.g. processor never started.
+    brpop_latency_us: LatencyStats,
     errors: u64,
 }
 
@@ -149,6 +162,7 @@ pub fn write_json(
                 errors_per_sec: r.errors_per_sec.clone(),
                 latency_per_sec_us: r.latency_per_sec.clone(),
                 latency_us: r.latency.clone(),
+                brpop_latency_us: r.brpop_latency.clone(),
                 errors: r.errors,
             })
             .collect(),

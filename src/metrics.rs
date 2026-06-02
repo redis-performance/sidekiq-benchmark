@@ -76,6 +76,9 @@ pub struct TrialResult {
     pub errors_per_sec: Vec<u64>,
     pub latency_per_sec: HashMap<String, Vec<u64>>,
     pub latency: LatencyStats,
+    /// Per-BRPOP-call latency (µs), recorded inside rusty-sidekiq's fetcher
+    /// only for calls that returned work. Empty when nothing observed.
+    pub brpop_latency: LatencyStats,
     pub errors: u64,
     pub timed_out: bool,
 }
