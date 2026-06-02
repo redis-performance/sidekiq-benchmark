@@ -58,6 +58,15 @@ pub fn print_trial_line(r: &TrialResult) {
             fmt_us(r.brpop_latency.max),
         );
     }
+    if r.lpush_latency.total_count > 0 {
+        println!(
+            "                       LPUSH        p50={:<8} p99={:<8} p99.9={:<8} max={}",
+            fmt_us(r.lpush_latency.p50),
+            fmt_us(r.lpush_latency.p99),
+            fmt_us(r.lpush_latency.p99_9),
+            fmt_us(r.lpush_latency.max),
+        );
+    }
 }
 
 /// Print the summary table after all trials.
@@ -121,6 +130,9 @@ struct JsonResult {
     /// (empty-queue timeouts skipped). Empty (`total_count == 0`) when no
     /// samples were captured — e.g. processor never started.
     brpop_latency_us: LatencyStats,
+    /// Per-LPUSH-call HDR percentiles, populated only in steady-state mode.
+    /// Empty in the default burst-then-drain path.
+    lpush_latency_us: LatencyStats,
     errors: u64,
 }
 
@@ -163,6 +175,7 @@ pub fn write_json(
                 latency_per_sec_us: r.latency_per_sec.clone(),
                 latency_us: r.latency.clone(),
                 brpop_latency_us: r.brpop_latency.clone(),
+                lpush_latency_us: r.lpush_latency.clone(),
                 errors: r.errors,
             })
             .collect(),

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,23 @@ struct Cli {
     /// shape for Phase 2 reproductions.
     #[arg(long)]
     track_stats: bool,
+
+    /// Run in sustained steady-state mode: producer + consumer execute
+    /// concurrently for this many seconds, producer LPUSHes one job at a time
+    /// (with per-call HDR latency captured), consumer's BRPOP drains in
+    /// parallel. Soft-caps in-flight at `--target-queue-depth`. `--jobs` is
+    /// ignored in this mode. When unset (default), the tool keeps the
+    /// existing burst-then-drain behavior: pre-fill via bulk pipeline, then
+    /// run workers until the queue empties.
+    #[arg(long)]
+    duration_secs: Option<u64>,
+
+    /// Steady-state mode only: soft cap on `produced − completed`. When the
+    /// gap reaches this, the producer yields (100 µs sleeps) until the
+    /// consumer catches up. Stops the queue from growing unbounded if the
+    /// consumer can't keep up. Default 1000 ≈ 5 ms of work at ~200K jobs/s.
+    #[arg(long, default_value = "1000")]
+    target_queue_depth: u64,
 }
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
@@ -300,6 +318,17 @@ struct TrialConfig<'a> {
     quiet: bool,
     percentile_specs: &'a [PercentileSpec],
     track_stats: bool,
+    /// `None` = burst-then-drain (pre-fill happens before run_trial).
+    /// `Some(_)` = steady-state — producer runs inside run_trial for the
+    /// configured duration; the consumer ends when the producer signals stop.
+    steady_state: Option<SteadyStateCfg>,
+    payload_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SteadyStateCfg {
+    duration_secs: u64,
+    target_queue_depth: u64,
 }
 
 fn empty_histogram() -> Histogram<u64> {
@@ -313,6 +342,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
     let (brpop_tx, brpop_rx) = mpsc::unbounded_channel::<u64>();
+    let (lpush_tx, lpush_rx) = mpsc::unbounded_channel::<u64>();
 
     // Histogram collector — drains the latency channel and builds a HDR histogram.
     // Channel closes when all latency_tx clones are dropped (main sentinel + worker clones).
@@ -331,6 +361,18 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let brpop_collector = tokio::spawn(async move {
         let mut hist = empty_histogram();
         let mut rx = brpop_rx;
+        while let Some(us) = rx.recv().await {
+            let _ = hist.record(us.max(1));
+        }
+        hist
+    });
+
+    // LPUSH histogram collector — populated only in steady-state mode (the
+    // burst-then-drain path uses bulk pipelines where per-LPUSH timing is
+    // meaningless). Stays empty otherwise.
+    let lpush_collector = tokio::spawn(async move {
+        let mut hist = empty_histogram();
+        let mut rx = lpush_rx;
         while let Some(us) = rx.recv().await {
             let _ = hist.record(us.max(1));
         }
@@ -367,6 +409,40 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     // Keep abort_handle so we can abort after timeout even after consuming proc_handle
     let mut proc_handle = tokio::spawn(async move { processor.run().await });
     let abort_handle = proc_handle.abort_handle();
+
+    // Steady-state producer (only in steady-state mode). Runs concurrently
+    // with the consumer, LPUSHing one job at a time and recording per-call
+    // latency. Soft-caps in-flight at target_queue_depth. Token cancellation
+    // ends the producer cleanly at duration_secs.
+    let producer_token = CancellationToken::new();
+    let producer_handle = if let Some(ss) = cfg.steady_state {
+        let producer_url = cfg.url.to_string();
+        let producer_queues = cfg.queues.to_vec();
+        let producer_metrics = metrics.clone();
+        let producer_tx = lpush_tx.clone();
+        let producer_cancel = producer_token.clone();
+        let payload_size = cfg.payload_size;
+        Some(tokio::spawn(async move {
+            let client = redis::Client::open(producer_url.as_str())
+                .context("invalid Redis URL for producer")?;
+            let mut conn = client
+                .get_multiplexed_async_connection()
+                .await
+                .context("producer failed to connect to Redis")?;
+            producer::stream_enqueue(
+                &mut conn,
+                &producer_queues,
+                payload_size,
+                ss.target_queue_depth,
+                producer_metrics,
+                producer_tx,
+                producer_cancel,
+            )
+            .await
+        }))
+    } else {
+        None
+    };
 
     // Per-second samples collected by the monitor task
     let throughput_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -426,13 +502,21 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let mut timed_out = false;
     let mut proc_exited_early = false;
 
-    // Wait for all jobs to complete, timeout, or processor failure
+    // Wait condition depends on mode:
+    //  - Burst (default): wait until consumer drains target_jobs OR timeout.
+    //  - Steady-state: run for the configured duration. The producer runs
+    //    concurrently and the trial ends when the duration elapses; the
+    //    consumer is then drained as part of the shutdown sequence below.
     tokio::select! {
-        _ = done_rx.wait_for(|v| *v) => {},
-        _ = tokio::time::sleep(Duration::from_secs(cfg.timeout_secs)) => {
-            if !cfg.quiet { eprintln!(); }
-            eprintln!("  [timeout after {}s]", cfg.timeout_secs);
-            timed_out = true;
+        _ = done_rx.wait_for(|v| *v), if cfg.steady_state.is_none() => {},
+        _ = tokio::time::sleep(Duration::from_secs(
+            cfg.steady_state.map(|s| s.duration_secs).unwrap_or(cfg.timeout_secs)
+        )) => {
+            if cfg.steady_state.is_none() {
+                if !cfg.quiet { eprintln!(); }
+                eprintln!("  [timeout after {}s]", cfg.timeout_secs);
+                timed_out = true;
+            }
         }
         res = &mut proc_handle => {
             if !cfg.quiet { eprintln!(); }
@@ -445,24 +529,42 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         }
     }
 
-    let duration = start.elapsed();
+    // Snapshot the trial window NOW, before producer/consumer shutdown.
+    // In steady-state mode the consumer keeps draining the queue during the
+    // ~5 s shutdown timeout; if we read completed at the end, jobs/s would be
+    // diluted by drain work that didn't happen at sustained-load conditions.
+    let window_duration = start.elapsed();
+    let window_completed = metrics.get_completed();
+    let window_errors = metrics.get_errors();
+
     if !cfg.quiet && !timed_out {
         println!();
     }
 
     monitor.abort();
 
+    // Stop the producer first (so no more LPUSHes hit Redis) before draining
+    // the consumer. In burst mode this is a no-op (no producer task).
+    producer_token.cancel();
+    if let Some(handle) = producer_handle {
+        // Producer's drop closes its lpush_tx clone; we still hold the main
+        // sentinel below.
+        let _ = handle.await;
+    }
+
     if proc_exited_early {
         // Processor::run() waits for in-flight workers before returning, so all worker
         // latency_tx clones are already dropped. Drop the sentinel and the channel closes.
         drop(latency_tx);
         drop(brpop_tx);
+        drop(lpush_tx);
     } else {
         // Signal graceful shutdown and give workers up to 5 s to finish current jobs.
         // Workers drop their latency_tx clones when they exit, closing the channel.
         token.cancel();
         drop(latency_tx); // drop sentinel before waiting so channel can close
         drop(brpop_tx); // same — fetcher's clones close once Processor::run returns
+        drop(lpush_tx); // producer already exited above; main sentinel is the last clone
         let timed_shutdown = tokio::time::timeout(Duration::from_secs(5), proc_handle).await;
         if timed_shutdown.is_err() {
             // Workers are stuck; force-abort and give the runtime a tick to clean up
@@ -474,9 +576,15 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     // Channels are now closed — collectors drain buffered values and return histograms
     let hist = collector.await.unwrap_or_else(|_| empty_histogram());
     let brpop_hist = brpop_collector.await.unwrap_or_else(|_| empty_histogram());
+    let lpush_hist = lpush_collector.await.unwrap_or_else(|_| empty_histogram());
 
-    let total_jobs = metrics.get_completed();
-    let errors = metrics.get_errors();
+    // Use the window snapshots (taken before shutdown drain) for the
+    // headline numbers. The per-second monitor samples capture progression
+    // during the window naturally; readings after window_duration are
+    // discarded below.
+    let total_jobs = window_completed;
+    let errors = window_errors;
+    let duration = window_duration;
     let throughput_per_sec = throughput_samples
         .lock()
         .map(|v| v.clone())
@@ -503,6 +611,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         latency_per_sec,
         latency: LatencyStats::from_histogram(&hist),
         brpop_latency: LatencyStats::from_histogram(&brpop_hist),
+        lpush_latency: LatencyStats::from_histogram(&lpush_hist),
         errors,
         timed_out,
     })
@@ -561,11 +670,16 @@ async fn main() -> Result<()> {
     };
 
     println!("\n=== sidekiq-bench — {tag} ===");
+    let workload_label = match cli.duration_secs {
+        Some(d) => format!(
+            "steady-state {d}s (target depth {})",
+            report::format_n(cli.target_queue_depth)
+        ),
+        None => format!("jobs={}", report::format_n(cli.jobs)),
+    };
     println!(
-        "    {}  jobs={}  queues={}",
-        display_url,
-        report::format_n(cli.jobs),
-        queues_label
+        "    {}  {}  queues={}",
+        display_url, workload_label, queues_label
     );
     println!();
 
@@ -589,6 +703,11 @@ async fn main() -> Result<()> {
         quiet: cli.quiet,
         percentile_specs: &percentile_specs,
         track_stats: cli.track_stats,
+        steady_state: cli.duration_secs.map(|d| SteadyStateCfg {
+            duration_secs: d,
+            target_queue_depth: cli.target_queue_depth,
+        }),
+        payload_size: cli.payload_size,
     };
     // Warmup uses the same settings but targets warmup_jobs completions
     let warmup_cfg = TrialConfig {
@@ -600,19 +719,28 @@ async fn main() -> Result<()> {
     let mut results: Vec<TrialResult> = Vec::new();
     let mut any_timeout = false;
 
-    // Warn if the queue fill will likely use significant Redis memory.
-    // ~300 B per job (class, jid, args array, queue, retry, timestamps).
-    let estimated_mb = cli.jobs as f64 * 300.0 / (1024.0 * 1024.0);
-    if estimated_mb > 100.0 {
-        eprintln!(
-            "warning: estimated peak Redis memory ~{:.0} MB ({} jobs × ~300 B/job)",
-            estimated_mb,
-            report::format_n(cli.jobs)
-        );
+    // Warn if the burst-mode pre-fill will likely use significant Redis
+    // memory. ~300 B per job (class, jid, args array, queue, retry,
+    // timestamps). Steady-state mode keeps in_flight bounded by
+    // target_queue_depth, so the memory ceiling is small and the warning
+    // would be misleading.
+    if cli.duration_secs.is_none() {
+        let estimated_mb = cli.jobs as f64 * 300.0 / (1024.0 * 1024.0);
+        if estimated_mb > 100.0 {
+            eprintln!(
+                "warning: estimated peak Redis memory ~{:.0} MB ({} jobs × ~300 B/job)",
+                estimated_mb,
+                report::format_n(cli.jobs)
+            );
+        }
     }
 
     for &n_workers in &workers_list {
-        if cli.warmup_jobs > 0 {
+        // Warmup + pre-fill only apply to burst-then-drain. In steady-state
+        // mode the producer runs concurrently inside run_trial and the
+        // backlog starts empty (Phase 3 handles 240 GB pre-fill via a
+        // separate one-shot script, not through this tool's CLI).
+        if cli.duration_secs.is_none() && cli.warmup_jobs > 0 {
             pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
             producer::bulk_enqueue(&mut conn, &queue_names, cli.warmup_jobs, cli.payload_size)
                 .await?;
@@ -622,8 +750,14 @@ async fn main() -> Result<()> {
             run_trial(&warmup_cfg, n_workers).await?;
         }
 
-        pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
-        producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs, cli.payload_size).await?;
+        if cli.duration_secs.is_none() {
+            pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
+            producer::bulk_enqueue(&mut conn, &queue_names, cli.jobs, cli.payload_size).await?;
+        } else {
+            // Steady-state: still clear stale backlog so the trial starts at
+            // a known empty state. Producer fills as the consumer drains.
+            pre_trial_clear(&mut conn, &queue_names, cli.allow_flushdb).await?;
+        }
 
         if !cli.quiet {
             print!("  [{n_workers:>4} workers] ");
@@ -707,6 +841,29 @@ mod tests {
     }
 
     #[test]
+    fn duration_secs_default_is_none_burst_mode() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
+        assert!(cli.duration_secs.is_none());
+        assert_eq!(cli.target_queue_depth, 1000);
+    }
+
+    #[test]
+    fn duration_secs_opts_into_steady_state() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "sidekiq-bench",
+            "--duration-secs",
+            "30",
+            "--target-queue-depth",
+            "5000",
+        ])
+        .unwrap();
+        assert_eq!(cli.duration_secs, Some(30));
+        assert_eq!(cli.target_queue_depth, 5000);
+    }
+
+    #[test]
     fn sanitize_tag_strips_unsafe_chars() {
         assert_eq!(sanitize_tag("redis-8.0"), "redis-8.0"); // dots and dashes kept
         assert_eq!(sanitize_tag("redis/8.0"), "redis-8.0"); // slash → dash
@@ -767,6 +924,8 @@ mod tests {
             allow_flushdb: false,
             payload_size: 0,
             track_stats: false,
+            duration_secs: None,
+            target_queue_depth: 1000,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -800,6 +959,8 @@ mod tests {
             allow_flushdb: false,
             payload_size: 0,
             track_stats: false,
+            duration_secs: None,
+            target_queue_depth: 1000,
         };
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
@@ -827,6 +988,8 @@ mod tests {
             allow_flushdb: false,
             payload_size: 0,
             track_stats: false,
+            duration_secs: None,
+            target_queue_depth: 1000,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();

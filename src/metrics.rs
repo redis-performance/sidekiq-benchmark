@@ -79,6 +79,10 @@ pub struct TrialResult {
     /// Per-BRPOP-call latency (µs), recorded inside rusty-sidekiq's fetcher
     /// only for calls that returned work. Empty when nothing observed.
     pub brpop_latency: LatencyStats,
+    /// Per-LPUSH-call latency (µs), populated only in steady-state mode.
+    /// Empty (`total_count == 0`) in the default burst-then-drain path,
+    /// which uses bulk pipelines where per-LPUSH timing isn't meaningful.
+    pub lpush_latency: LatencyStats,
     pub errors: u64,
     pub timed_out: bool,
 }
