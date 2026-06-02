@@ -3,6 +3,23 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// Upper bound (µs) for every HDR histogram in this crate. Was 60 s in
+/// Phases 1-2 where jobs are produced and consumed within the same trial.
+/// Phase 3 Experiment 3 (latency-vs-fill) runs the consumer on a pre-existing
+/// backlog whose oldest jobs can be hours old — those samples were silently
+/// dropped from the e2e histogram at the 60 s ceiling. 1 hour gives plenty of
+/// headroom for backlog ages while staying well inside HDR's design range;
+/// memory cost is negligible (HDR is logarithmic in range).
+pub const HIST_UPPER_BOUND_US: u64 = 3_600_000_000;
+
+/// Build an empty HDR histogram with the canonical bounds shared by every
+/// site in the crate (3-significant-digit precision, 1 µs lower, 1 hour
+/// upper). Tests + callers should construct via this helper so the precision
+/// stays consistent.
+pub fn empty_histogram() -> Histogram<u64> {
+    Histogram::<u64>::new_with_bounds(1, HIST_UPPER_BOUND_US, 3).expect("valid histogram bounds")
+}
+
 /// Shared counters updated atomically by worker tasks.
 pub struct Metrics {
     pub completed: AtomicU64,
@@ -16,10 +33,7 @@ impl Metrics {
         Self {
             completed: AtomicU64::new(0),
             errors: AtomicU64::new(0),
-            per_sec_hist: Mutex::new(
-                Histogram::<u64>::new_with_bounds(1, 60_000_000, 3)
-                    .expect("valid histogram bounds"),
-            ),
+            per_sec_hist: Mutex::new(empty_histogram()),
         }
     }
 
@@ -127,7 +141,7 @@ mod tests {
 
     #[test]
     fn empty_histogram_returns_zero_stats() {
-        let hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+        let hist = empty_histogram();
         let stats = LatencyStats::from_histogram(&hist);
         assert_eq!(stats.total_count, 0);
         assert_eq!(stats.p99, 0);
@@ -137,7 +151,7 @@ mod tests {
 
     #[test]
     fn histogram_records_values_correctly() {
-        let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+        let mut hist = empty_histogram();
         for i in 1..=1000u64 {
             let _ = hist.record(i * 1_000);
         }

@@ -340,8 +340,9 @@ struct SteadyStateCfg {
 }
 
 fn empty_histogram() -> Histogram<u64> {
-    // HDRHistogram requires low >= 1; values are clamped to .max(1) before recording
-    Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds")
+    // Re-export of metrics::empty_histogram so the local module name resolves
+    // without an extra `use` line in every call site.
+    metrics::empty_histogram()
 }
 
 async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResult> {
