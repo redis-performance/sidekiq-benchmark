@@ -104,6 +104,15 @@ struct Cli {
     /// Envelope is ~200 B, so 800 → ~1 KB total job; 3800 → ~4 KB.
     #[arg(long, default_value = "6")]
     payload_size: usize,
+
+    /// Enable Sidekiq stats tracking — matches Ruby Sidekiq's `Sidekiq[:track_stats]`
+    /// (default `true` upstream). When set, every processed job adds four
+    /// extra Redis commands (`HSET <identity>:work <tid> <work_json>` on start,
+    /// `HDEL` + `INCR stat:processed` + `INCR stat:processed:<date>` on
+    /// completion). Default off so the tool keeps its historical lean output
+    /// shape for Phase 2 reproductions.
+    #[arg(long)]
+    track_stats: bool,
 }
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
@@ -290,6 +299,7 @@ struct TrialConfig<'a> {
     timeout_secs: u64,
     quiet: bool,
     percentile_specs: &'a [PercentileSpec],
+    track_stats: bool,
 }
 
 fn empty_histogram() -> Histogram<u64> {
@@ -333,8 +343,11 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
         target_jobs: cfg.jobs,
     };
 
-    let mut processor = sidekiq::Processor::new(redis_pool, cfg.queues.to_vec())
-        .with_config(sidekiq::ProcessorConfig::default().num_workers(n_workers));
+    let mut processor = sidekiq::Processor::new(redis_pool, cfg.queues.to_vec()).with_config(
+        sidekiq::ProcessorConfig::default()
+            .num_workers(n_workers)
+            .track_stats(cfg.track_stats),
+    );
     processor.register(w);
 
     let token = processor.get_cancellation_token();
@@ -558,6 +571,7 @@ async fn main() -> Result<()> {
         timeout_secs: cli.timeout,
         quiet: cli.quiet,
         percentile_specs: &percentile_specs,
+        track_stats: cli.track_stats,
     };
     // Warmup uses the same settings but targets warmup_jobs completions
     let warmup_cfg = TrialConfig {
@@ -662,6 +676,20 @@ mod tests {
     }
 
     #[test]
+    fn track_stats_default_is_off() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
+        assert!(!cli.track_stats);
+    }
+
+    #[test]
+    fn track_stats_flag_is_presence_based() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench", "--track-stats"]).unwrap();
+        assert!(cli.track_stats);
+    }
+
+    #[test]
     fn sanitize_tag_strips_unsafe_chars() {
         assert_eq!(sanitize_tag("redis-8.0"), "redis-8.0"); // dots and dashes kept
         assert_eq!(sanitize_tag("redis/8.0"), "redis-8.0"); // slash → dash
@@ -721,6 +749,7 @@ mod tests {
             quiet: false,
             allow_flushdb: false,
             payload_size: 0,
+            track_stats: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -753,6 +782,7 @@ mod tests {
             quiet: false,
             allow_flushdb: false,
             payload_size: 0,
+            track_stats: false,
         };
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
@@ -779,6 +809,7 @@ mod tests {
             quiet: false,
             allow_flushdb: false,
             payload_size: 0,
+            track_stats: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();

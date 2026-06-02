@@ -106,6 +106,7 @@ cargo build --release
 | `--timeout` | — | `300` | Per-trial timeout in seconds |
 | `--quiet` | — | false | Suppress per-second progress dots |
 | `--allow-flushdb` | `SIDEKIQ_BENCH_ALLOW_FLUSHDB` | false | FLUSHDB before each trial (default: DEL only the queue keys — safe on shared Redis) |
+| `--track-stats` | — | false | Emit the per-job stats writes Ruby Sidekiq makes when `Sidekiq[:track_stats] = true` (its default): `HSET <identity>:work <tid> <work_json>` on start, then `HDEL` + `INCR stat:processed` + `INCR stat:processed:<date>` on completion. Adds 4 Redis commands per job — significant cost at small payloads. Off by default to keep historical (Phase 2) wire shape. |
 
 Equivalent to Ruby's `THREADS=N ITER=500 COUNT=1000 bin/sidekiqload`:
 ```bash
