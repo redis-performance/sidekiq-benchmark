@@ -106,6 +106,11 @@ cargo build --release
 | `--timeout` | — | `300` | Per-trial timeout in seconds |
 | `--quiet` | — | false | Suppress per-second progress dots |
 | `--allow-flushdb` | `SIDEKIQ_BENCH_ALLOW_FLUSHDB` | false | FLUSHDB before each trial (default: DEL only the queue keys — safe on shared Redis) |
+| `--track-stats` | — | false | Emit the per-job stats writes Ruby Sidekiq makes when `Sidekiq[:track_stats] = true` (its default): `HSET <identity>:work <tid> <work_json>` on start, then `HDEL` + `INCR stat:processed` + `INCR stat:processed:<date>` on completion. Adds 4 Redis commands per job — significant cost at small payloads. Off by default to keep historical (Phase 2) wire shape. |
+| `--duration-secs` | — | — | Opt-in steady-state mode: producer + consumer run concurrently for N seconds. Producer LPUSHes one job at a time (with per-call HDR latency), consumer's BRPOP drains in parallel. `--jobs` is ignored in this mode; `--warmup-jobs` is skipped. When unset (default), keeps the burst-then-drain behavior (pre-fill via bulk pipeline, then drain). |
+| `--target-queue-depth` | — | `1000` | Steady-state only — soft cap on in-flight jobs (`produced − completed`). Producer yields when at the cap so the queue doesn't grow unbounded. ~5 ms of work at 200K jobs/s. |
+| `--producer-mode` | — | `sidekiq` | Steady-state only — what the producer emits per push. `sidekiq` (default) mirrors Ruby `Sidekiq::Client.push`: `SADD queues <q>` + `LPUSH queue:<q> <job>` pipelined per push. `raw` emits a bare LPUSH only (Phase 1/2 baseline, useful for cross-comparison with pre-Phase-3 results). |
+| `--no-clear` | — | false | Steady-state only — skip the per-trial `DEL queue:<name>`. Preserves any pre-existing backlog at trial start (required by Phase 3 Experiment 3, where 25/100/240 GB of pre-filled jobs sit in the queue while the bench runs a steady-state workload on top). |
 
 Equivalent to Ruby's `THREADS=N ITER=500 COUNT=1000 bin/sidekiqload`:
 ```bash

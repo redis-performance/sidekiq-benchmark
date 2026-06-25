@@ -25,6 +25,7 @@ redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rus
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # Latency histogram
 hdrhistogram = "7"
