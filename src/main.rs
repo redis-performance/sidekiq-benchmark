@@ -141,6 +141,16 @@ struct Cli {
     #[arg(long, default_value = "64")]
     producer_parallelism: usize,
 
+    /// Steady-state mode only: what wire shape the producer emits per
+    /// pushed job. `sidekiq` (default) mirrors Ruby `Sidekiq::Client.push`
+    /// — every push pipelines `SADD queues <queue>` + `LPUSH queue:<queue>`
+    /// into a single round trip, matching the producer-side Redis work an
+    /// application calling `Worker.perform_async` would generate. `raw`
+    /// emits a bare LPUSH per push (Phase 1/2 baseline), useful for
+    /// cross-comparison with pre-Phase-3 results.
+    #[arg(long, default_value = "sidekiq", value_parser = ["sidekiq", "raw"])]
+    producer_mode: String,
+
     /// Skip the per-trial DEL of `queue:<name>` — preserves any pre-existing
     /// backlog at trial start. Required by Phase 3 Experiment 3 (latency-vs-fill),
     /// where the test runs a steady-state workload against a 25 / 100 / 240 GB
@@ -347,6 +357,7 @@ struct SteadyStateCfg {
     duration_secs: u64,
     target_queue_depth: u64,
     producer_parallelism: usize,
+    producer_mode: producer::ProducerMode,
 }
 
 fn empty_histogram() -> Histogram<u64> {
@@ -454,6 +465,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
                 payload_size,
                 ss.target_queue_depth,
                 ss.producer_parallelism,
+                ss.producer_mode,
                 producer_metrics,
                 producer_tx,
                 producer_cancel,
@@ -727,6 +739,10 @@ async fn main() -> Result<()> {
             duration_secs: d,
             target_queue_depth: cli.target_queue_depth,
             producer_parallelism: cli.producer_parallelism,
+            producer_mode: match cli.producer_mode.as_str() {
+                "raw" => producer::ProducerMode::Raw,
+                _ => producer::ProducerMode::Sidekiq,
+            },
         }),
         payload_size: cli.payload_size,
     };
@@ -891,6 +907,34 @@ mod tests {
     }
 
     #[test]
+    fn producer_mode_default_is_sidekiq() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
+        assert_eq!(cli.producer_mode, "sidekiq");
+    }
+
+    #[test]
+    fn producer_mode_accepts_raw_and_sidekiq() {
+        use clap::Parser;
+        assert_eq!(
+            Cli::try_parse_from(["sidekiq-bench", "--producer-mode", "raw"])
+                .unwrap()
+                .producer_mode,
+            "raw"
+        );
+        assert_eq!(
+            Cli::try_parse_from(["sidekiq-bench", "--producer-mode", "sidekiq"])
+                .unwrap()
+                .producer_mode,
+            "sidekiq"
+        );
+        assert!(
+            Cli::try_parse_from(["sidekiq-bench", "--producer-mode", "bogus"]).is_err(),
+            "clap should reject unknown producer-mode values"
+        );
+    }
+
+    #[test]
     fn sanitize_tag_strips_unsafe_chars() {
         assert_eq!(sanitize_tag("redis-8.0"), "redis-8.0"); // dots and dashes kept
         assert_eq!(sanitize_tag("redis/8.0"), "redis-8.0"); // slash → dash
@@ -954,6 +998,7 @@ mod tests {
             duration_secs: None,
             target_queue_depth: 1000,
             producer_parallelism: 64,
+            producer_mode: "sidekiq".to_string(),
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
@@ -991,6 +1036,7 @@ mod tests {
             duration_secs: None,
             target_queue_depth: 1000,
             producer_parallelism: 64,
+            producer_mode: "sidekiq".to_string(),
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();
@@ -1022,6 +1068,7 @@ mod tests {
             duration_secs: None,
             target_queue_depth: 1000,
             producer_parallelism: 64,
+            producer_mode: "sidekiq".to_string(),
             no_clear: false,
         };
         let url = build_redis_url(&cli).unwrap();

@@ -70,10 +70,31 @@ pub async fn bulk_enqueue(
     Ok(())
 }
 
-/// Steady-state producer: fan out `parallelism` concurrent LPUSH tasks, each
-/// owning a clone of the multiplexed Redis connection, and let them
-/// LPUSH one job per iteration with per-call HDR latency recording until
-/// the cancellation token fires.
+/// What the producer emits per pushed job.
+///
+/// `Raw` is the historical Phase 1/2 wire shape: a single bare `LPUSH` per
+/// job, with a one-shot upfront `SADD queues <queue>` for every queue. Use
+/// this when cross-comparing against pre-Phase-3 results.
+///
+/// `Sidekiq` mirrors Ruby Sidekiq's `Sidekiq::Client.push` — every job's
+/// enqueue emits two commands in a single pipelined round trip:
+///
+///   SADD queues <queue>
+///   LPUSH queue:<queue> <job_json>
+///
+/// matching the on-the-wire shape an application using `Worker.perform_async`
+/// would generate. This is the right mode for benchmarks meant to reflect
+/// what a customer's Sidekiq client puts on Redis. Default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProducerMode {
+    Raw,
+    Sidekiq,
+}
+
+/// Steady-state producer: fan out `parallelism` concurrent push tasks, each
+/// owning a clone of the multiplexed Redis connection, and let them push
+/// one job per iteration with per-call HDR latency recording until the
+/// cancellation token fires.
 ///
 /// Soft-caps in-flight at `target_queue_depth` (= produced − completed) so
 /// the consumer keeps up; when at the cap, each task yields briefly instead
@@ -81,14 +102,23 @@ pub async fn bulk_enqueue(
 /// (useful for diagnostics + sanity checks against the consumer's completed
 /// count).
 ///
+/// The wire shape per push is controlled by `mode`:
+///   - `ProducerMode::Raw`     → 1 LPUSH per push (Phase 1/2 baseline).
+///   - `ProducerMode::Sidekiq` → 1 SADD + 1 LPUSH pipelined per push
+///     (Ruby `Sidekiq::Client.push` wire shape). Adds ~1 cmd/job of
+///     producer-side Redis work.
+///
+/// Recorded latency (`lpush_latency_tx`) in Sidekiq mode covers the full
+/// SADD+LPUSH pipeline round trip — the per-push wire-level cost as a real
+/// Sidekiq client would see it.
+///
 /// Parallelism rationale (Phase 3 pre-flight, 2026-06-02): a single
-/// sequential `MultiplexedConnection::LPUSH` cycles at ~290 µs RTT to a
-/// peered RS endpoint — about 3.4K jobs/s. Phase 3's 240 GB scenario needs
-/// the producer to sustain ~200K jobs/s to match a saturated single-shard
-/// consumer; fanning out N concurrent in-flight LPUSHes through the same
-/// connection (which the `redis` crate's multiplexer pipelines on the
-/// single socket) scales the producer to ~3.4K × N jobs/s. Default 64 is
-/// comfortable headroom for the 240 GB single-shard scenario.
+/// sequential push cycles at ~290 µs RTT to a peered RS endpoint — about
+/// 3.4K jobs/s. Phase 3's 240 GB scenario needs the producer to sustain
+/// ~200K jobs/s to match a saturated single-shard consumer; fanning out N
+/// concurrent in-flight pushes through the same multiplexed connection
+/// scales the producer to ~3.4K × N jobs/s. Default 64 is comfortable
+/// headroom for the 240 GB single-shard scenario.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_enqueue(
     conn: redis::aio::MultiplexedConnection,
@@ -96,13 +126,16 @@ pub async fn stream_enqueue(
     payload_size: usize,
     target_queue_depth: u64,
     parallelism: usize,
+    mode: ProducerMode,
     metrics: Arc<Metrics>,
     lpush_latency_tx: mpsc::UnboundedSender<u64>,
     cancel: CancellationToken,
 ) -> Result<u64> {
     anyhow::ensure!(parallelism >= 1, "producer parallelism must be >= 1");
 
-    // Register all queues once for Sidekiq-web / monitoring tools.
+    // Register all queues once for Sidekiq-web / monitoring tools. In
+    // Sidekiq mode this primes the `queues` set so the per-push SADD is
+    // always a no-op fast path on a hot member.
     {
         let mut sadd_conn = conn.clone();
         let mut sadd_pipe = redis::pipe();
@@ -149,11 +182,28 @@ pub async fn stream_enqueue(
                 };
 
                 let start = Instant::now();
-                let res = redis::cmd("LPUSH")
-                    .arg(format!("queue:{queue}"))
-                    .arg(payload)
-                    .query_async::<i64>(&mut c)
-                    .await;
+                let res: redis::RedisResult<()> = match mode {
+                    ProducerMode::Raw => {
+                        // Phase 1/2 baseline: bare LPUSH, no per-push SADD.
+                        redis::cmd("LPUSH")
+                            .arg(format!("queue:{queue}"))
+                            .arg(&payload)
+                            .query_async::<i64>(&mut c)
+                            .await
+                            .map(|_| ())
+                    }
+                    ProducerMode::Sidekiq => {
+                        // Ruby `Sidekiq::Client.push` wire shape: SADD + LPUSH
+                        // pipelined into a single round trip per job.
+                        let mut pipe = redis::pipe();
+                        pipe.cmd("SADD").arg("queues").arg(queue).ignore();
+                        pipe.cmd("LPUSH")
+                            .arg(format!("queue:{queue}"))
+                            .arg(&payload)
+                            .ignore();
+                        pipe.query_async::<()>(&mut c).await
+                    }
+                };
                 if res.is_err() {
                     // Producer connection died — most likely target Redis went
                     // away. Bail this task; the consumer will detect EOF and
