@@ -51,8 +51,16 @@ impl Metrics {
 
     /// Snapshot and reset the per-second window histogram.
     /// Called by the monitor task once per second.
+    ///
+    /// Recovers from a poisoned lock (rather than unwrap()-panicking, which
+    /// would kill the monitor task) — consistent with `record_latency_per_sec`
+    /// and every other Mutex use in this codebase, all of which already
+    /// degrade gracefully instead of propagating a panic.
     pub fn drain_per_sec(&self) -> Histogram<u64> {
-        let mut g = self.per_sec_hist.lock().unwrap();
+        let mut g = self
+            .per_sec_hist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snap = g.clone();
         g.reset();
         snap

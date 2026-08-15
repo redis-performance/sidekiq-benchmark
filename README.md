@@ -31,9 +31,12 @@ shutdown.
 
 ### Docker Hub
 
-> **Memory:** the default run pre-fills 500,000 jobs (~300 B each) → **~143 MB**
-> peak Redis memory before workers drain the queue. Use `--jobs 50000` (~14 MB)
-> for a quick local smoke test.
+> **Memory:** the default run pre-fills 500,000 jobs (~206 B each at the
+> default `--payload-size 6`) → **~98 MB** peak Redis memory before workers
+> drain the queue. Memory scales with `--payload-size` (~200 B envelope +
+> payload bytes per job) — a run with `--payload-size 3800` (~4 KB jobs) at
+> the same job count would be ~20x that. Use `--jobs 50000` (~10 MB at
+> defaults) for a quick local smoke test.
 
 ```bash
 # Run against local Redis (default: db 13, 500k jobs, workers 10/50/100/200)
@@ -71,10 +74,36 @@ REDIS_IMAGE=redis:7.4 docker compose run --rm bench  # override to a different v
 REDIS_URL=redis://myhost:6379/0 docker compose run --rm bench
 ```
 
-### Pre-built binary
+### Install from GitHub Release
+
+Static Linux binaries are attached to every
+[GitHub Release](https://github.com/redis-performance/sidekiq-benchmark/releases)
+— no Rust toolchain required.
 
 ```bash
-sidekiq-bench --workers 10,50,100,200 --jobs 500000
+# Linux x86_64
+curl -LO https://github.com/redis-performance/sidekiq-benchmark/releases/download/v0.1.0/sidekiq-bench-x86_64-unknown-linux-gnu.tar.gz
+tar xzf sidekiq-bench-x86_64-unknown-linux-gnu.tar.gz
+./sidekiq-bench-x86_64-unknown-linux-gnu/sidekiq-bench --help
+
+# Linux aarch64 (arm64)
+curl -LO https://github.com/redis-performance/sidekiq-benchmark/releases/download/v0.1.0/sidekiq-bench-aarch64-unknown-linux-gnu.tar.gz
+tar xzf sidekiq-bench-aarch64-unknown-linux-gnu.tar.gz
+./sidekiq-bench-aarch64-unknown-linux-gnu/sidekiq-bench --help
+```
+
+Each tarball ships with `LICENSE` + `README.md`, and has a companion
+`.sha256` checksum file:
+
+```bash
+curl -LO https://github.com/redis-performance/sidekiq-benchmark/releases/download/v0.1.0/sidekiq-bench-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c sidekiq-bench-x86_64-unknown-linux-gnu.tar.gz.sha256
+```
+
+Then run it directly, or move the binary onto your `$PATH`:
+
+```bash
+./sidekiq-bench-x86_64-unknown-linux-gnu/sidekiq-bench --workers 10,50,100,200 --jobs 500000
 ```
 
 ### From source
