@@ -7,7 +7,7 @@ on:
 
 jobs:
   ci:
-    name: Build, lint, test, smoke
+    name: Build, lint, test
     runs-on: ubuntu-latest
 
     services:
@@ -38,26 +38,10 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Clippy
-        run: cargo clippy -- -D warnings
+      - name: Clippy (including tests)
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Unit tests
-        run: cargo test
-
-      - name: Smoke test (end-to-end against Redis service)
-        run: |
-          cargo run --release -- \
-            --url redis://127.0.0.1:6379/0 \
-            --workers 2 \
-            --jobs 500 \
-            --timeout 60 \
-            --output /tmp/smoke.json \
-            --quiet \
-            --tag smoke
-          # Verify the run completed all jobs without timing out
-          jq -e '
-            .results[0].total_jobs == 500 and
-            .results[0].timed_out == false and
-            .results[0].errors == 0 and
-            .results[0].latency_us.total_count == 500
-          ' /tmp/smoke.json
+      - name: Unit + integration tests (real Redis via the service container above)
+        run: cargo test --release
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379

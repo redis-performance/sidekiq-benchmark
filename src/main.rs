@@ -109,8 +109,17 @@ struct Cli {
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
 
 fn build_redis_url(cli: &Cli) -> Result<String> {
-    let mut u =
-        url::Url::parse(&cli.url).with_context(|| format!("invalid Redis URL: {}", cli.url))?;
+    // Redacted form of the raw --url for use in *this function's own* error
+    // messages. --url can carry an inline password (redis://user:pass@host),
+    // and every fallible step below (parse, set_host, set_port, set_password)
+    // used to interpolate `cli.url` verbatim — leaking the password to
+    // stderr/exit output on any malformed input. `redact_url()` can't help
+    // here because it requires the URL to already parse; this is a
+    // string-level best-effort redaction that works even on unparseable input.
+    let safe_url_for_errors = redact_raw_best_effort(&cli.url);
+
+    let mut u = url::Url::parse(&cli.url)
+        .with_context(|| format!("invalid Redis URL: {safe_url_for_errors}"))?;
 
     if let Some(host) = &cli.host {
         u.set_host(Some(host))
@@ -118,7 +127,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
     if let Some(port) = cli.port {
         u.set_port(Some(port))
-            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {safe_url_for_errors}"))?;
     }
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
@@ -127,7 +136,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
         u.set_password(Some(password))
-            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {safe_url_for_errors}"))?;
     }
     // Ensure db path is present
     if u.path().trim_matches('/').is_empty() {
@@ -147,6 +156,31 @@ fn redact_url(raw: &str) -> String {
             u.to_string()
         }
         Err(_) => raw.to_string(),
+    }
+}
+
+/// Best-effort password redaction for strings that may not even be a valid
+/// URL yet (used in error messages emitted *while parsing* --url, where
+/// `redact_url`'s `url::Url::parse` fallback would just hand back the raw,
+/// unredacted string). Masks the password segment of a `scheme://user:pass@`
+/// prefix using plain substring search, independent of full URL validity.
+fn redact_raw_best_effort(raw: &str) -> String {
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let after_scheme = scheme_end + 3;
+    let Some(at_rel) = raw[after_scheme..].rfind('@') else {
+        return raw.to_string();
+    };
+    let at_idx = after_scheme + at_rel;
+    let userinfo = &raw[after_scheme..at_idx];
+    match userinfo.find(':') {
+        Some(colon_rel) => {
+            let colon_idx = after_scheme + colon_rel;
+            format!("{}:****{}", &raw[..colon_idx], &raw[at_idx..])
+        }
+        // No ':' — userinfo could still be a bare token; mask it all
+        None => format!("{}****{}", &raw[..after_scheme], &raw[at_idx..]),
     }
 }
 
@@ -478,14 +512,65 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     })
 }
 
+// ── Safety caps ───────────────────────────────────────────────────────────────
+// Fat-fingering an extra zero onto these flags shouldn't be able to OOM the
+// process or the target Redis. Values are well above any realistic use case
+// documented in the README (workers up to "200+", num-queues 2-8, jobs up to
+// ~4 KB via --payload-size).
+
+/// Each entry becomes one bb8 pool + a tokio task per worker; unbounded values
+/// risk exhausting FDs/memory locally and Redis's default maxclients (10000).
+const MAX_WORKERS: usize = 10_000;
+/// Each queue is a distinct Redis key plus an entry in the round-robin table.
+const MAX_NUM_QUEUES: usize = 10_000;
+/// `SidekiqJob::build_arg0` does `"a".repeat(payload_size)` with no other
+/// bound — an extreme value would abort the process via allocator failure
+/// rather than fail cleanly. 64 MiB is far beyond any realistic job payload.
+const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+
+/// Reject CLI values that would either hang indefinitely-ish (zero workers)
+/// or risk exhausting local/remote resources (unbounded workers/queues/payload).
+/// Split out from `main` so it's unit-testable without a live Redis.
+fn validate_cli(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
+    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    anyhow::ensure!(
+        cli.num_queues <= MAX_NUM_QUEUES,
+        "--num-queues {} exceeds the safety cap of {MAX_NUM_QUEUES}",
+        cli.num_queues
+    );
+    anyhow::ensure!(
+        !cli.workers.is_empty(),
+        "--workers must specify at least one concurrency level"
+    );
+    for &w in &cli.workers {
+        anyhow::ensure!(
+            w > 0,
+            "--workers values must be > 0 (got 0) — a zero-worker trial can never \
+             dequeue jobs and would hang until --timeout instead of failing fast"
+        );
+        anyhow::ensure!(
+            w <= MAX_WORKERS,
+            "--workers value {w} exceeds the safety cap of {MAX_WORKERS}"
+        );
+    }
+    anyhow::ensure!(
+        cli.payload_size <= MAX_PAYLOAD_SIZE,
+        "--payload-size {} exceeds the safety cap of {MAX_PAYLOAD_SIZE} bytes ({} MiB)",
+        cli.payload_size,
+        MAX_PAYLOAD_SIZE / (1024 * 1024)
+    );
+    anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
-    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    validate_cli(&cli)?;
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
@@ -570,13 +655,18 @@ async fn main() -> Result<()> {
     let mut any_timeout = false;
 
     // Warn if the queue fill will likely use significant Redis memory.
-    // ~300 B per job (class, jid, args array, queue, retry, timestamps).
-    let estimated_mb = cli.jobs as f64 * 300.0 / (1024.0 * 1024.0);
+    // ~200 B fixed envelope (class, jid, args array, queue, retry, timestamps)
+    // plus the args[0] filler controlled by --payload-size (default 6 B, so
+    // ~206 B/job matches the historical "~300 B" estimate at defaults; the
+    // 200 B figure matches the --payload-size help text's own envelope claim).
+    let bytes_per_job = 200.0 + cli.payload_size as f64;
+    let estimated_mb = cli.jobs as f64 * bytes_per_job / (1024.0 * 1024.0);
     if estimated_mb > 100.0 {
         eprintln!(
-            "warning: estimated peak Redis memory ~{:.0} MB ({} jobs × ~300 B/job)",
+            "warning: estimated peak Redis memory ~{:.0} MB ({} jobs × ~{:.0} B/job)",
             estimated_mb,
-            report::format_n(cli.jobs)
+            report::format_n(cli.jobs),
+            bytes_per_job
         );
     }
 
@@ -654,11 +744,130 @@ impl<'a> Clone for TrialConfig<'a> {
 mod tests {
     use super::*;
 
+    /// Parse a default Cli then apply extra args on top, for concise test setup.
+    fn test_cli(extra_args: &[&str]) -> Cli {
+        let mut args = vec!["sidekiq-bench"];
+        args.extend_from_slice(extra_args);
+        Cli::try_parse_from(args).expect("test args should parse")
+    }
+
     #[test]
     fn payload_size_default_matches_legacy_string_length() {
-        use clap::Parser;
         let cli = Cli::try_parse_from(["sidekiq-bench"]).unwrap();
         assert_eq!(cli.payload_size, 6);
+    }
+
+    // ── validate_cli ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_cli_accepts_defaults() {
+        assert!(validate_cli(&test_cli(&[])).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_jobs() {
+        let cli = test_cli(&["--jobs", "0"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--jobs"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_num_queues() {
+        let cli = test_cli(&["--num-queues", "0"]);
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_oversized_num_queues() {
+        let cli = test_cli(&["--num-queues", "10001"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("safety cap"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_worker_entry() {
+        // A zero anywhere in the comma-separated list must fail fast rather
+        // than silently hang a trial until --timeout.
+        let cli = test_cli(&["--workers", "10,0,50"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--workers"));
+        assert!(err.to_string().contains("hang"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_oversized_worker_value() {
+        let cli = test_cli(&["--workers", "50000000"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("safety cap"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_oversized_payload_size() {
+        let cli = test_cli(&["--payload-size", "999999999999"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--payload-size"));
+    }
+
+    #[test]
+    fn validate_cli_accepts_max_payload_size() {
+        let cli = test_cli(&["--payload-size", &MAX_PAYLOAD_SIZE.to_string()]);
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_timeout() {
+        let cli = test_cli(&["--timeout", "0"]);
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    // ── redact_raw_best_effort ───────────────────────────────────────────────
+
+    #[test]
+    fn redact_raw_best_effort_masks_user_and_pass() {
+        let raw = "redis://user:hunter2@host:6379/0";
+        let redacted = redact_raw_best_effort(raw);
+        assert!(!redacted.contains("hunter2"), "leaked: {redacted}");
+        assert!(redacted.contains("user:****@host:6379/0"));
+    }
+
+    #[test]
+    fn redact_raw_best_effort_masks_password_only_form() {
+        let raw = "redis://:hunter2@host:6379/0";
+        let redacted = redact_raw_best_effort(raw);
+        assert!(!redacted.contains("hunter2"), "leaked: {redacted}");
+    }
+
+    #[test]
+    fn redact_raw_best_effort_handles_malformed_url_with_password() {
+        // A URL malformed enough that url::Url::parse fails (space in host)
+        // must still not leak the embedded password.
+        let raw = "redis://user:hunter2@ho st:6379/0";
+        assert!(
+            url::Url::parse(raw).is_err(),
+            "test URL should fail to parse"
+        );
+        let redacted = redact_raw_best_effort(raw);
+        assert!(!redacted.contains("hunter2"), "leaked: {redacted}");
+    }
+
+    #[test]
+    fn redact_raw_best_effort_leaves_no_credential_url_unchanged() {
+        let raw = "redis://host:6379/0";
+        assert_eq!(redact_raw_best_effort(raw), raw);
+    }
+
+    #[test]
+    fn redact_raw_best_effort_handles_non_url_input() {
+        // No "://" at all — must not panic, just pass through.
+        assert_eq!(redact_raw_best_effort("not a url"), "not a url");
+    }
+
+    #[test]
+    fn build_redis_url_error_never_leaks_password_on_parse_failure() {
+        let cli = test_cli(&["--url", "redis://user:hunter2@ho st:6379/0"]);
+        let err = build_redis_url(&cli).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("hunter2"), "password leaked in error: {msg}");
     }
 
     #[test]
