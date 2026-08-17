@@ -14,9 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             # Free GitHub-hosted ARM runner for public repos — native build,
             # no cross/QEMU needed (unlike docker.yml, which does need QEMU
             # because a single `docker buildx` invocation targets both
@@ -40,8 +40,29 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # rustls pulls in `ring`, which compiles C and assembly, so the musl target needs a musl
+      # C toolchain even though the rest of the tree is pure Rust.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      # A successful build says nothing about where the artifact can RUN. The previous -gnu
+      # releases were built on ubuntu-24.04 and silently required GLIBC_2.39, so they could not
+      # execute on Ubuntu 22.04 (2.35), Debian 12 (2.36) or RHEL 9 (2.34) -- and the failure mode
+      # was a loader error at first use, not a build error. Assert the floor is gone.
+      - name: Assert no glibc dependency
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/sidekiq-bench"
+          if objdump -T "$BIN" 2>/dev/null | grep -qE 'GLIBC_[0-9]+\.[0-9]+'; then
+            MAX=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+            echo "::error::artifact still links against glibc (max $MAX); it will not run on older hosts"
+            exit 1
+          fi
+          file "$BIN"
+          echo "OK: statically linked, no glibc version floor"
 
       - name: Package tarball + checksum
         run: |
