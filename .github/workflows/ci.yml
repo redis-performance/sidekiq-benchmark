@@ -41,6 +41,19 @@ jobs:
       - name: Clippy (including tests)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Guard tls-rustls-insecure feature is resolved
+        # --insecure (src/main.rs) relies on redis-rs's #insecure URL fragment actually
+        # skipping cert verification, which only happens when the crate is built with the
+        # tls-rustls-insecure feature (Cargo.toml). Nothing else would catch a regression
+        # here: existing tests only assert on the constructed URL string, not on the
+        # feature being compiled in, so a dependency edit that silently drops this feature
+        # would make --insecure a silent no-op while every test still passes.
+        run: |
+          if ! cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure; then
+            echo "::error::tls-rustls-insecure feature is missing from the resolved redis dependency graph — --insecure would silently become a no-op" >&2
+            exit 1
+          fi
+
       - name: Unit + integration tests (real Redis via the service container above)
         run: cargo test --release
         env:

@@ -168,6 +168,21 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     Ok(u.to_string())
 }
 
+/// Whether the connection will end up on the rediss:// (TLS) scheme once --tls is applied,
+/// mirroring build_redis_url()'s own upgrade rule (`cli.tls && u.scheme() == "redis"`).
+/// Shared by validate_cli() so the two agree on edge cases like `--tls --insecure --url
+/// unix:///...` — a raw `cli.url.starts_with("rediss://")` check would miss that --tls
+/// never upgrades a non-redis scheme (e.g. `unix://`), and validate_cli must reject
+/// --insecure there instead of relying on --tls alone to (wrongly) wave it through.
+/// An unparseable --url is treated as "not TLS" here; build_redis_url() still reports the
+/// actual parse error.
+fn resolves_to_tls_scheme(cli: &Cli) -> bool {
+    match url::Url::parse(&cli.url) {
+        Ok(u) => u.scheme() == "rediss" || (cli.tls && u.scheme() == "redis"),
+        Err(_) => false,
+    }
+}
+
 /// Return the URL with the password replaced by **** for logging and JSON output.
 fn redact_url(raw: &str) -> String {
     match url::Url::parse(raw) {
@@ -584,9 +599,10 @@ fn validate_cli(cli: &Cli) -> Result<()> {
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
     anyhow::ensure!(
-        !cli.insecure || cli.tls || cli.url.starts_with("rediss://"),
+        !cli.insecure || resolves_to_tls_scheme(cli),
         "--insecure only makes sense with --tls (or a rediss:// --url) — plain redis:// \
-         connections have no certificate verification to skip"
+         connections (and non-redis schemes like unix://, which --tls cannot upgrade) \
+         have no certificate verification to skip"
     );
     Ok(())
 }
@@ -601,6 +617,16 @@ async fn main() -> Result<()> {
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
+
+    // Warn loudly that certificate verification is off — this is the whole point of
+    // --insecure, but it's a silent security downgrade otherwise (man-in-the-middle
+    // exposure), so it shouldn't pass without a visible trace in the output.
+    if cli.insecure {
+        eprintln!(
+            "warning: TLS certificate verification is disabled (--insecure) — never use \
+             this against a production endpoint you care about authenticating."
+        );
+    }
 
     // Warn loudly if FLUSHDB is enabled on db 0 — application data lives there by default.
     if cli.allow_flushdb {
@@ -1033,6 +1059,16 @@ mod tests {
     fn validate_cli_accepts_insecure_with_rediss_url() {
         let cli = test_cli(&["--url", "rediss://127.0.0.1:6379/0", "--insecure"]);
         assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_with_tls_on_non_redis_scheme() {
+        // --tls only upgrades a `redis://` scheme to `rediss://` (see build_redis_url);
+        // it cannot do anything for a unix:// socket URL, so --insecure has no effect
+        // here and should be rejected instead of waved through just because --tls is set.
+        let cli = test_cli(&["--tls", "--insecure", "--url", "unix:///tmp/redis.sock"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--insecure"));
     }
 
     #[test]
