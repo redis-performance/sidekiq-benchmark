@@ -47,6 +47,13 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
+    /// Skip TLS certificate verification (only meaningful with --tls). Required to connect
+    /// to servers with a self-signed or private-CA cert — the normal case for test/staging/
+    /// ephemeral benchmark deployments. Equivalent to appending `#insecure` to a rediss:// URL.
+    /// Never use this against a production endpoint you care about authenticating.
+    #[arg(long, env = "REDIS_TLS_INSECURE")]
+    insecure: bool,
+
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
     /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
     /// or most managed Redis, so `--db 0` is usually required against those.
@@ -134,6 +141,13 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
+    }
+    if cli.insecure {
+        // redis-rs's TLS insecure escape hatch is a `#insecure` fragment on a rediss:// URL
+        // (see redis::ConnectionInfo parsing), not a separate ConnectionInfo field — so the
+        // flag is applied here rather than after redis::Client::open. It only has any effect
+        // once the crate is built with the `tls-rustls-insecure` feature (see Cargo.toml).
+        u.set_fragment(Some("insecure"));
     }
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
@@ -569,6 +583,11 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         MAX_PAYLOAD_SIZE / (1024 * 1024)
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    anyhow::ensure!(
+        !cli.insecure || cli.tls || cli.url.starts_with("rediss://"),
+        "--insecure only makes sense with --tls (or a rediss:// --url) — plain redis:// \
+         connections have no certificate verification to skip"
+    );
     Ok(())
 }
 
@@ -925,6 +944,7 @@ mod tests {
             port: None,
             password: Some("p@ss/word".into()),
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -957,6 +977,7 @@ mod tests {
             port: None,
             password: None,
             tls: true,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -976,6 +997,45 @@ mod tests {
     }
 
     #[test]
+    fn build_redis_url_insecure_appends_fragment() {
+        // The redis-rs TLS insecure escape hatch is the `#insecure` URL fragment (only
+        // effective when the crate is built with tls-rustls-insecure, per Cargo.toml).
+        let cli = test_cli(&["--tls", "--insecure"]);
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_without_insecure_has_no_fragment() {
+        let cli = test_cli(&["--tls"]);
+        let url = build_redis_url(&cli).unwrap();
+        assert!(!url.contains('#'), "unexpected fragment in {url}");
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_without_tls() {
+        let cli = test_cli(&["--insecure"]);
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--insecure"));
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_tls() {
+        let cli = test_cli(&["--tls", "--insecure"]);
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_rediss_url() {
+        let cli = test_cli(&["--url", "rediss://127.0.0.1:6379/0", "--insecure"]);
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
     fn build_redis_url_host_port_override() {
         let cli = Cli {
             url: "redis://127.0.0.1:6379/0".into(),
@@ -983,6 +1043,7 @@ mod tests {
             port: Some(6380),
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1059,6 +1120,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1084,6 +1146,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: None,
             workers: vec![10],
             jobs: 1000,
@@ -1109,6 +1172,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: None,
             workers: vec![10],
             jobs: 1000,
