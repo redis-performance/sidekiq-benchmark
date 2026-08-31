@@ -611,6 +611,18 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // redis-rs's rustls integration (tls-rustls / tokio-rustls-comp) pulls in rustls with
+    // no crypto backend enabled — neither "ring" nor "aws-lc-rs" — so without this call,
+    // any TLS connection attempt (verifying or --insecure) panics at handshake setup with
+    // "Could not automatically determine the process-level CryptoProvider from Rustls
+    // crate features." Must run once, before the first Redis connection is opened.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect(
+            "installing the process-default rustls CryptoProvider should only fail if \
+                 one was already installed, which cannot happen this early in main()",
+        );
+
     let cli = Cli::parse();
 
     validate_cli(&cli)?;
