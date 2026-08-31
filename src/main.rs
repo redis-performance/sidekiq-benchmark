@@ -138,7 +138,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
         u.set_port(Some(port))
             .map_err(|_| anyhow::anyhow!("cannot set port on URL: {safe_url_for_errors}"))?;
     }
-    if cli.tls && u.scheme() == "redis" {
+    if tls_upgrades_scheme(u.scheme(), cli.tls) {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
     }
@@ -168,8 +168,17 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     Ok(u.to_string())
 }
 
+/// Whether a URL currently on `scheme` will end up on rediss:// (TLS) once --tls is
+/// applied. This is the single owner of the "redis + --tls => rediss" upgrade rule —
+/// build_redis_url() calls it to actually perform the upgrade, and resolves_to_tls_scheme()
+/// calls it to answer the same question without mutating a URL, so the rule is defined
+/// exactly once instead of being reimplemented in both places.
+fn tls_upgrades_scheme(scheme: &str, tls: bool) -> bool {
+    tls && scheme == "redis"
+}
+
 /// Whether the connection will end up on the rediss:// (TLS) scheme once --tls is applied,
-/// mirroring build_redis_url()'s own upgrade rule (`cli.tls && u.scheme() == "redis"`).
+/// via tls_upgrades_scheme() — the same rule build_redis_url() uses to actually upgrade it.
 /// Shared by validate_cli() so the two agree on edge cases like `--tls --insecure --url
 /// unix:///...` — a raw `cli.url.starts_with("rediss://")` check would miss that --tls
 /// never upgrades a non-redis scheme (e.g. `unix://`), and validate_cli must reject
@@ -178,9 +187,22 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
 /// actual parse error.
 fn resolves_to_tls_scheme(cli: &Cli) -> bool {
     match url::Url::parse(&cli.url) {
-        Ok(u) => u.scheme() == "rediss" || (cli.tls && u.scheme() == "redis"),
+        Ok(u) => u.scheme() == "rediss" || tls_upgrades_scheme(u.scheme(), cli.tls),
         Err(_) => false,
     }
+}
+
+/// Whether an already-built Redis URL disables TLS certificate verification via the
+/// `#insecure` fragment — regardless of whether that fragment came from --insecure (see
+/// build_redis_url, which only *sets* the fragment when cli.insecure is true) or was
+/// already present in a raw --url/REDIS_URL value that build_redis_url leaves untouched
+/// otherwise. main() keys its startup warning off this rather than cli.insecure so both
+/// paths are caught in one place.
+fn url_has_insecure_fragment(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.fragment().map(|f| f == "insecure"))
+        .unwrap_or(false)
 }
 
 /// Return the URL with the password replaced by **** for logging and JSON output.
@@ -632,10 +654,12 @@ async fn main() -> Result<()> {
 
     // Warn loudly that certificate verification is off — this is the whole point of
     // --insecure, but it's a silent security downgrade otherwise (man-in-the-middle
-    // exposure), so it shouldn't pass without a visible trace in the output.
-    if cli.insecure {
+    // exposure), so it shouldn't pass without a visible trace in the output. Keyed off
+    // the built URL's #insecure fragment (not cli.insecure) so a fragment that arrived
+    // via a raw --url/REDIS_URL — without --insecure ever being passed — still warns.
+    if url_has_insecure_fragment(&url) {
         eprintln!(
-            "warning: TLS certificate verification is disabled (--insecure) — never use \
+            "warning: TLS certificate verification is disabled (#insecure) — never use \
              this against a production endpoint you care about authenticating."
         );
     }
@@ -1052,6 +1076,34 @@ mod tests {
         let cli = test_cli(&["--tls"]);
         let url = build_redis_url(&cli).unwrap();
         assert!(!url.contains('#'), "unexpected fragment in {url}");
+    }
+
+    // ── url_has_insecure_fragment (drives the startup warning) ──────────────────
+
+    #[test]
+    fn url_has_insecure_fragment_false_for_default_invocation() {
+        // No --insecure, no fragment in --url: the built URL must not carry #insecure,
+        // so the startup warning must not fire.
+        let cli = test_cli(&[]);
+        let url = build_redis_url(&cli).unwrap();
+        assert!(
+            !url_has_insecure_fragment(&url),
+            "unexpected warning for {url}"
+        );
+    }
+
+    #[test]
+    fn url_has_insecure_fragment_true_for_preexisting_fragment_in_url() {
+        // A raw --url that already carries #insecure (e.g. copy-pasted, or set via
+        // REDIS_URL) must still trigger the warning even though --insecure was never
+        // passed — build_redis_url() only *sets* the fragment when cli.insecure is true,
+        // it never strips one the user already supplied.
+        let cli = test_cli(&["--url", "rediss://127.0.0.1:6379/0#insecure"]);
+        let url = build_redis_url(&cli).unwrap();
+        assert!(
+            url_has_insecure_fragment(&url),
+            "expected warning to fire for {url}"
+        );
     }
 
     #[test]
