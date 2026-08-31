@@ -48,6 +48,16 @@ jobs:
         # here: existing tests only assert on the constructed URL string, not on the
         # feature being compiled in, so a dependency edit that silently drops this feature
         # would make --insecure a silent no-op while every test still passes.
+        #
+        # NOTE: this grep only checks that the feature *string* is resolved in the redis
+        # dependency graph — it says nothing about whether redis's internal rustls and
+        # this crate's own direct rustls dep (Cargo.toml) actually unify to a single
+        # rustls instance, which is what makes main()'s one install_default() call
+        # effective for both. A future `redis` version bump could move its rustls
+        # requirement out of range with ours and break that unification (silent no-op or
+        # a renewed CryptoProvider panic) without this check noticing. The "TLS handshake
+        # smoke test" step below, which drives a real TLS connection through the built
+        # binary, is the only thing here that would actually catch that.
         run: |
           if ! cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure; then
             echo "::error::tls-rustls-insecure feature is missing from the resolved redis dependency graph — --insecure would silently become a no-op" >&2
@@ -138,5 +148,17 @@ jobs:
             --output tls-smoke-insecure.json
           grep -q '"total_jobs": 1000' tls-smoke-insecure.json
           grep -q '"errors": 0' tls-smoke-insecure.json
+
+          # With a raw #insecure fragment on --url and no --insecure flag: this is the
+          # exact case url_disables_tls_verification() (src/main.rs) exists to catch — a
+          # rediss:// URL that already carries #insecure (e.g. copy-pasted, or set via
+          # REDIS_URL) must skip verification and connect successfully even though
+          # --insecure was never passed on the command line. Must succeed exactly like
+          # the --insecure-flag run above.
+          ./target/release/sidekiq-bench --url "rediss://localhost:16390/0#insecure" \
+            --jobs 1000 --workers 5 --timeout 30 --quiet \
+            --output tls-smoke-url-fragment.json
+          grep -q '"total_jobs": 1000' tls-smoke-url-fragment.json
+          grep -q '"errors": 0' tls-smoke-url-fragment.json
 
           docker rm -f redis-tls-smoke

@@ -192,16 +192,25 @@ fn resolves_to_tls_scheme(cli: &Cli) -> bool {
     }
 }
 
-/// Whether an already-built Redis URL disables TLS certificate verification via the
-/// `#insecure` fragment — regardless of whether that fragment came from --insecure (see
-/// build_redis_url, which only *sets* the fragment when cli.insecure is true) or was
-/// already present in a raw --url/REDIS_URL value that build_redis_url leaves untouched
-/// otherwise. main() keys its startup warning off this rather than cli.insecure so both
-/// paths are caught in one place.
-fn url_has_insecure_fragment(url: &str) -> bool {
+/// Whether an already-built Redis URL disables TLS certificate verification: it must
+/// resolve to `rediss://` (i.e. actually be a TLS connection) *and* carry the
+/// `#insecure` fragment — fragment alone is not enough. A plain `redis://...#insecure`
+/// URL (no --tls, no rediss:// scheme) never enables TLS, so warning "certificate
+/// verification is disabled" for it would be misleading: it understates the real
+/// problem (an unencrypted connection has no certificate to verify in the first
+/// place), rather than describing it.
+///
+/// The `#insecure` fragment itself may have come from --insecure (see build_redis_url,
+/// which only *sets* the fragment when cli.insecure is true) or already been present in
+/// a raw --url/REDIS_URL value that build_redis_url leaves untouched otherwise. main()
+/// keys its startup warning off this function rather than cli.insecure so both paths are
+/// caught in one place. validate_cli()'s own `--insecure` rejection uses the same
+/// scheme == "rediss" gate via resolves_to_tls_scheme(), so the two can never disagree
+/// about what counts as an insecure TLS connection.
+fn url_disables_tls_verification(url: &str) -> bool {
     url::Url::parse(url)
         .ok()
-        .and_then(|u| u.fragment().map(|f| f == "insecure"))
+        .map(|u| u.scheme() == "rediss" && u.fragment() == Some("insecure"))
         .unwrap_or(false)
 }
 
@@ -620,6 +629,10 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         MAX_PAYLOAD_SIZE / (1024 * 1024)
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    // Same scheme == "rediss" gate as url_disables_tls_verification() uses on the built
+    // URL's warning: --insecure only means anything once a fragment lands on an actual
+    // rediss:// connection, so reject it up front here rather than let it silently do
+    // nothing on plain redis:// (or a scheme --tls can't upgrade, like unix://).
     anyhow::ensure!(
         !cli.insecure || resolves_to_tls_scheme(cli),
         "--insecure only makes sense with --tls (or a rediss:// --url) — plain redis:// \
@@ -655,9 +668,11 @@ async fn main() -> Result<()> {
     // Warn loudly that certificate verification is off — this is the whole point of
     // --insecure, but it's a silent security downgrade otherwise (man-in-the-middle
     // exposure), so it shouldn't pass without a visible trace in the output. Keyed off
-    // the built URL's #insecure fragment (not cli.insecure) so a fragment that arrived
-    // via a raw --url/REDIS_URL — without --insecure ever being passed — still warns.
-    if url_has_insecure_fragment(&url) {
+    // the built URL's scheme + #insecure fragment (not cli.insecure) so a fragment that
+    // arrived via a raw --url/REDIS_URL — without --insecure ever being passed — still
+    // warns, but only when a TLS connection is actually in play (see
+    // url_disables_tls_verification).
+    if url_disables_tls_verification(&url) {
         eprintln!(
             "warning: TLS certificate verification is disabled (#insecure) — never use \
              this against a production endpoint you care about authenticating."
@@ -1078,22 +1093,22 @@ mod tests {
         assert!(!url.contains('#'), "unexpected fragment in {url}");
     }
 
-    // ── url_has_insecure_fragment (drives the startup warning) ──────────────────
+    // ── url_disables_tls_verification (drives the startup warning) ──────────────
 
     #[test]
-    fn url_has_insecure_fragment_false_for_default_invocation() {
+    fn url_disables_tls_verification_false_for_default_invocation() {
         // No --insecure, no fragment in --url: the built URL must not carry #insecure,
         // so the startup warning must not fire.
         let cli = test_cli(&[]);
         let url = build_redis_url(&cli).unwrap();
         assert!(
-            !url_has_insecure_fragment(&url),
+            !url_disables_tls_verification(&url),
             "unexpected warning for {url}"
         );
     }
 
     #[test]
-    fn url_has_insecure_fragment_true_for_preexisting_fragment_in_url() {
+    fn url_disables_tls_verification_true_for_preexisting_fragment_in_url() {
         // A raw --url that already carries #insecure (e.g. copy-pasted, or set via
         // REDIS_URL) must still trigger the warning even though --insecure was never
         // passed — build_redis_url() only *sets* the fragment when cli.insecure is true,
@@ -1101,8 +1116,24 @@ mod tests {
         let cli = test_cli(&["--url", "rediss://127.0.0.1:6379/0#insecure"]);
         let url = build_redis_url(&cli).unwrap();
         assert!(
-            url_has_insecure_fragment(&url),
+            url_disables_tls_verification(&url),
             "expected warning to fire for {url}"
+        );
+    }
+
+    #[test]
+    fn url_disables_tls_verification_false_for_plain_scheme_with_stray_fragment() {
+        // A `#insecure` fragment on a plain redis:// URL (no --tls, no --insecure flag)
+        // is inert — there is no TLS connection at all, so the "certificate verification
+        // is disabled" warning must NOT fire. It would be misleading: the real gap there
+        // is an unencrypted connection, not merely an unverified certificate. This is the
+        // round-5 regression case: --url redis://host:6379/0#insecure used to warn about
+        // TLS verification despite never using TLS.
+        let cli = test_cli(&["--url", "redis://127.0.0.1:6379/0#insecure"]);
+        let url = build_redis_url(&cli).unwrap();
+        assert!(
+            !url_disables_tls_verification(&url),
+            "did not expect a TLS-verification warning for plain redis:// url {url}"
         );
     }
 
