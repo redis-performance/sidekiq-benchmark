@@ -21,9 +21,10 @@ async-trait = "0.1"
 # Redis client — aligned with rusty-sidekiq's redis dep
 # tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates
 # tokio-rustls-comp: async TLS integration; tls-rustls-webpki-roots: bundled root CAs (works in containers without OS ca-certificates)
-# tls-rustls-insecure: without this, the documented `#insecure` URL fragment is parsed but
-# has zero effect — the code path that actually skips certificate verification is compiled
-# out, so --tls silently cannot connect to self-signed/private-CA servers (see --insecure).
+# tls-rustls-insecure: without this, the documented `#insecure` URL fragment is NOT
+# silently ignored — the code path that actually skips certificate verification is
+# compiled out, so redis-rs hard-fails the connection at connect time with an explicit
+# "Cannot create insecure client without tls-rustls-insecure feature" error (see --insecure).
 redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
 # Direct rustls dependency purely to call CryptoProvider::install_default() at startup.

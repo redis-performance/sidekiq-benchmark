@@ -47,20 +47,22 @@ jobs:
         # tls-rustls-insecure feature (Cargo.toml). Nothing else would catch a regression
         # here: existing tests only assert on the constructed URL string, not on the
         # feature being compiled in, so a dependency edit that silently drops this feature
-        # would make --insecure a silent no-op while every test still passes.
+        # would make --insecure hard-fail every TLS connection attempt (redis-rs returns
+        # an explicit "Cannot create insecure client without tls-rustls-insecure feature"
+        # error at connect time — it is not silently ignored) while every test still passes.
         #
         # NOTE: this grep only checks that the feature *string* is resolved in the redis
         # dependency graph — it says nothing about whether redis's internal rustls and
         # this crate's own direct rustls dep (Cargo.toml) actually unify to a single
         # rustls instance, which is what makes main()'s one install_default() call
         # effective for both. A future `redis` version bump could move its rustls
-        # requirement out of range with ours and break that unification (silent no-op or
-        # a renewed CryptoProvider panic) without this check noticing. The "TLS handshake
+        # requirement out of range with ours and break that unification (a hard connection
+        # error or a renewed CryptoProvider panic) without this check noticing. The "TLS handshake
         # smoke test" step below, which drives a real TLS connection through the built
         # binary, is the only thing here that would actually catch that.
         run: |
           if ! cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure; then
-            echo "::error::tls-rustls-insecure feature is missing from the resolved redis dependency graph — --insecure would silently become a no-op" >&2
+            echo "::error::tls-rustls-insecure feature is missing from the resolved redis dependency graph — --insecure would hard-fail every TLS connection attempt instead of silently becoming a no-op" >&2
             exit 1
           fi
 
