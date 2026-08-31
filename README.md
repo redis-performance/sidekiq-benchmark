@@ -122,6 +122,7 @@ cargo build --release
 | `--port` | — | — | Override port component of URL |
 | `--password` | `REDIS_PASSWORD` | — | Auth (prefer env var — CLI exposes it in `ps`) |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
+| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (only meaningful with `--tls`). Required to connect to self-signed/private-CA servers — see [TLS caveats](#tls-caveats) below |
 | `--db` | — | `13` | Database number (matches Ruby sidekiqload safety default) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels — one trial each |
 | `--jobs` | — | `500000` | Total jobs per trial |
@@ -140,6 +141,35 @@ Equivalent to Ruby's `THREADS=N ITER=500 COUNT=1000 bin/sidekiqload`:
 ```bash
 sidekiq-bench --workers N --jobs 500000
 ```
+
+### TLS caveats
+
+`--tls` upgrades the connection to `rediss://` and verifies the server's certificate
+against the bundled Mozilla root CAs (via `tls-rustls-webpki-roots`). That means it
+**cannot connect** to a server presenting a self-signed or private-CA certificate —
+the normal case for test/staging/ephemeral benchmark deployments — and fails with a
+certificate verification error.
+
+For those endpoints, pass `--insecure` (or set `REDIS_TLS_INSECURE=true`) alongside
+`--tls` to skip certificate verification:
+
+```bash
+sidekiq-bench --tls --insecure --host my-staging-redis --port 6380
+```
+
+Note that `REDIS_TLS_INSECURE` (like `REDIS_TLS`) is parsed by clap's boolean env
+handling, which only accepts the literal strings `true`/`false` — `REDIS_TLS_INSECURE=1`
+or `=0` is a parse error that aborts the binary before it connects, not a silent
+enable/disable.
+
+Also note that the redis-rs crate's documented `rediss://host:port/#insecure` URL
+fragment does nothing unless the crate is built with its `tls-rustls-insecure` Cargo
+feature — this repo enables it, but if you're vendoring or forking, make sure that
+feature stays on. Without it, the fragment is NOT silently ignored — verified directly
+against redis-1.5.0's source, `--insecure`/`#insecure` fails the connection outright
+with an explicit "Cannot create insecure client without tls-rustls-insecure feature"
+error. Never use `--insecure` against a production endpoint whose identity you
+actually need to authenticate.
 
 ### Multi-queue mode
 

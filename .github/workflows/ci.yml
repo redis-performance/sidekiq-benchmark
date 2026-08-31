@@ -41,7 +41,126 @@ jobs:
       - name: Clippy (including tests)
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Guard tls-rustls-insecure feature is resolved
+        # --insecure (src/main.rs) relies on redis-rs's #insecure URL fragment actually
+        # skipping cert verification, which only happens when the crate is built with the
+        # tls-rustls-insecure feature (Cargo.toml). Nothing else would catch a regression
+        # here: existing tests only assert on the constructed URL string, not on the
+        # feature being compiled in, so a dependency edit that silently drops this feature
+        # would make --insecure hard-fail every TLS connection attempt (redis-rs returns
+        # an explicit "Cannot create insecure client without tls-rustls-insecure feature"
+        # error at connect time — it is not silently ignored) while every test still passes.
+        #
+        # NOTE: this grep only checks that the feature *string* is resolved in the redis
+        # dependency graph — it says nothing about whether redis's internal rustls and
+        # this crate's own direct rustls dep (Cargo.toml) actually unify to a single
+        # rustls instance, which is what makes main()'s one install_default() call
+        # effective for both. A future `redis` version bump could move its rustls
+        # requirement out of range with ours and break that unification (a hard connection
+        # error or a renewed CryptoProvider panic) without this check noticing. The "TLS handshake
+        # smoke test" step below, which drives a real TLS connection through the built
+        # binary, is the only thing here that would actually catch that.
+        run: |
+          if ! cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure; then
+            echo "::error::tls-rustls-insecure feature is missing from the resolved redis dependency graph — --insecure would hard-fail every TLS connection attempt instead of silently becoming a no-op" >&2
+            exit 1
+          fi
+
       - name: Unit + integration tests (real Redis via the service container above)
         run: cargo test --release
         env:
           TEST_REDIS_URL: redis://127.0.0.1:6379
+
+      - name: TLS handshake smoke test (self-signed cert)
+        # Covers the one behavior this PR's TLS work actually changes end-to-end, which
+        # nothing above exercises: the redis-rs rustls CryptoProvider install (0f30bbd —
+        # before that fix, --tls didn't just fail, it *panicked* at handshake setup), the
+        # tls-rustls-insecure feature flag actually skipping cert verification, and the
+        # #insecure URL fragment handling (both the --insecure flag path and a raw
+        # --url/REDIS_URL that already carries #insecure). The "Guard tls-rustls-insecure"
+        # step above only checks the feature is *compiled in*; this is the only place a
+        # real TLS handshake against an untrusted cert is attempted.
+        run: |
+          set -euo pipefail
+
+          certs="$RUNNER_TEMP/tls-smoke-certs"
+          mkdir -p "$certs"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$certs/key.pem" -out "$certs/cert.pem" -days 1 -subj /CN=localhost
+          # openssl writes key.pem 0600, owned by the runner user; the container reads it
+          # as its own (different) user, so without this it fails "Permission denied"
+          # rather than "No such file" — worth the broader perms since this is a
+          # throwaway self-signed key that lives only for this job.
+          chmod 644 "$certs/key.pem"
+
+          # redis:8.6 (same image as the service container above) supports TLS out of the
+          # box via --tls-*; run it as a one-off container (not a `services:` entry, since
+          # those start before the cert files above exist) with cluster/replication/client-
+          # cert-auth disabled — irrelevant for a single-node self-signed smoke test and
+          # would otherwise require even more certs.
+          docker run -d --name redis-tls-smoke \
+            -p 16390:16390 \
+            -v "$certs:/tls:ro" \
+            redis:8.6 redis-server \
+            --port 0 \
+            --tls-port 16390 \
+            --tls-cert-file /tls/cert.pem \
+            --tls-key-file /tls/key.pem \
+            --tls-ca-cert-file /tls/cert.pem \
+            --tls-cluster no --tls-replication no --tls-auth-clients no
+
+          for i in $(seq 1 30); do
+            if docker exec redis-tls-smoke redis-cli --tls --insecure -p 16390 ping 2>/dev/null | grep -q PONG; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::redis-tls-smoke never became ready" >&2
+              docker logs redis-tls-smoke >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Without --insecure: connecting to a self-signed, untrusted cert must fail
+          # cleanly with a certificate error — NOT with the "no CryptoProvider installed"
+          # panic that --tls used to hit unconditionally before 0f30bbd.
+          set +e
+          ./target/release/sidekiq-bench --url rediss://localhost:16390/0 \
+            --jobs 100 --workers 5 --timeout 5 --quiet \
+            >tls-smoke-no-insecure.log 2>&1
+          status=$?
+          set -e
+          cat tls-smoke-no-insecure.log
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected sidekiq-bench to fail against an unverified self-signed cert without --insecure, but it exited 0" >&2
+            exit 1
+          fi
+          if grep -qi panic tls-smoke-no-insecure.log; then
+            echo "::error::sidekiq-bench panicked on the TLS handshake instead of failing cleanly — rustls CryptoProvider regression?" >&2
+            exit 1
+          fi
+          if ! grep -qi "certificate" tls-smoke-no-insecure.log; then
+            echo "::error::expected a certificate-related error without --insecure, got something else" >&2
+            exit 1
+          fi
+
+          # With --insecure: the same self-signed cert must now be accepted end to end.
+          ./target/release/sidekiq-bench --url rediss://localhost:16390/0 --insecure \
+            --jobs 1000 --workers 5 --timeout 30 --quiet \
+            --output tls-smoke-insecure.json
+          grep -q '"total_jobs": 1000' tls-smoke-insecure.json
+          grep -q '"errors": 0' tls-smoke-insecure.json
+
+          # With a raw #insecure fragment on --url and no --insecure flag: this is the
+          # exact case url_disables_tls_verification() (src/main.rs) exists to catch — a
+          # rediss:// URL that already carries #insecure (e.g. copy-pasted, or set via
+          # REDIS_URL) must skip verification and connect successfully even though
+          # --insecure was never passed on the command line. Must succeed exactly like
+          # the --insecure-flag run above.
+          ./target/release/sidekiq-bench --url "rediss://localhost:16390/0#insecure" \
+            --jobs 1000 --workers 5 --timeout 30 --quiet \
+            --output tls-smoke-url-fragment.json
+          grep -q '"total_jobs": 1000' tls-smoke-url-fragment.json
+          grep -q '"errors": 0' tls-smoke-url-fragment.json
+
+          docker rm -f redis-tls-smoke

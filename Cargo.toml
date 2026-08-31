@@ -21,7 +21,21 @@ async-trait = "0.1"
 # Redis client — aligned with rusty-sidekiq's redis dep
 # tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates
 # tokio-rustls-comp: async TLS integration; tls-rustls-webpki-roots: bundled root CAs (works in containers without OS ca-certificates)
-redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# tls-rustls-insecure: without this, the documented `#insecure` URL fragment is NOT
+# silently ignored — the code path that actually skips certificate verification is
+# compiled out, so redis-rs hard-fails the connection at connect time with an explicit
+# "Cannot create insecure client without tls-rustls-insecure feature" error (see --insecure).
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
+
+# Direct rustls dependency purely to call CryptoProvider::install_default() at startup.
+# redis's own `tls-rustls` feature pulls in rustls with default-features = false and only
+# the "std" feature — no crypto backend (ring/aws-lc-rs) is enabled anywhere in the tree
+# (verified via `cargo tree -i rustls`/`-e features`), and redis's public API does not
+# re-export the rustls crate. Without a process-level CryptoProvider installed, any TLS
+# connection attempt (verifying or --insecure) panics inside rustls at handshake setup:
+# "Could not automatically determine the process-level CryptoProvider from Rustls crate
+# features." The "ring" feature here matches the backend we install in main().
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
