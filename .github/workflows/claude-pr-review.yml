@@ -147,7 +147,7 @@ jobs:
             pull request in the authentic voice and standards of this project's
             real contributors. Read the skill's SKILL.md and both reference files
             first -- the whole point is grounding the review in what this
-            project's actual history shows, including how thin that
+            project's actual (very small) history shows, including how thin that
             history honestly is, not generic Rust code-review advice.
 
             The PR's title/body/commits/files/author, its full diff, and the
